@@ -1,0 +1,79 @@
+#  general-exporter 配置文件
+# 支持的 target 类型: url, docker, custom
+# 复制此文件为 config.yaml 并修改后使用
+
+server:
+  port: 8080
+  metrics_path: /metrics
+
+defaults:
+  interval: 30s       # 采集间隔
+  timeout: 10s        # 单次请求超时
+
+targets:
+  # ==================== 前端服务 ====================
+  - name: "frontend_main"
+    type: url
+    url: "https://example.com"
+    method: GET
+    expected_status: 200
+    interval: 15s
+    labels:
+      env: "prod"
+      tier: "frontend"
+
+  # ==================== Docker 容器 ====================
+  - name: "all_containers"
+    type: docker
+    mode: all           # all = 所有容器
+    interval: 30s
+    labels:
+      env: "prod"
+      tier: "docker"
+
+  # 指定容器示例（取消注释即可使用）
+  # - name: "key_containers"
+  #   type: docker
+  #   mode: filter
+  #   names:
+  #     - "nginx"
+  #     - "redis"
+  #     - "mysql"
+  #   interval: 15s
+  #   labels:
+  #     env: "prod"
+  #     tier: "docker"
+
+  # ==================== 自定义脚本 ====================
+  # - name: "skywell_node"
+  #   type: custom
+  #   script: "/opt/scripts/skywell-stats.sh"
+  #   labels:
+  #     env: "prod"
+  #     tier: "node"
+  #
+  #   脚本输出格式（每行: 指标名 数值）：
+  #   echo "skywell_cpu_percent 42.5"
+  #   echo "skywell_memory_bytes 512000000"
+  #   echo "skywell_connections 15"
+
+  # ==================== 后端服务 ====================
+  - name: "backend_api"
+    type: url
+    url: "http://localhost:8081/health"
+    method: GET
+    expected_status: 200
+    interval: 15s
+    labels:
+      env: "prod"
+      tier: "backend"
+
+  - name: "backend_grafana"
+    type: url
+    url: "http://localhost:3000/api/health"
+    method: GET
+    expected_status: 200
+    interval: 30s
+    labels:
+      env: "prod"
+      tier: "backend"
