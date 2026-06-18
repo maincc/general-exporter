@@ -65,6 +65,12 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
 	}
+	// 环境变量优先（方便 Docker 部署）
+	if portEnv := os.Getenv("EXPORTER_PORT"); portEnv != "" {
+		if p, err := strconv.Atoi(portEnv); err == nil && p > 0 {
+			cfg.Server.Port = p
+		}
+	}
 	if cfg.Server.MetricsPath == "" {
 		cfg.Server.MetricsPath = "/metrics"
 	}
