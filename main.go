@@ -333,12 +333,6 @@ func NewDockerCollector(cfg TargetConfig, m *DockerMetrics) *DockerCollector {
 }
 
 func (c *DockerCollector) Collect() {
-	// Reset stale metrics before each scrape
-	c.metrics.up.Reset()
-	c.metrics.cpuPercent.Reset()
-	c.metrics.memUsage.Reset()
-	c.metrics.memLimit.Reset()
-
 	containers, err := c.listContainers()
 	if err != nil {
 		log.Printf("[docker] list containers: %v", err)
@@ -526,6 +520,8 @@ func main() {
 	gatherer := &orderedGatherer{
 		metricsReg:       metricsReg,
 		mainReg:          mainReg,
+		urlMetrics:       urlMetrics,
+		dockerMetrics:    dockerMetrics,
 		urlCollectors:    urlCollectors,
 		dockerCollectors: dockerCollectors,
 		customCollectors: customCollectors,
@@ -548,12 +544,26 @@ func main() {
 type orderedGatherer struct {
 	metricsReg       *prometheus.Registry
 	mainReg          *prometheus.Registry
+	urlMetrics       *URLMetrics
+	dockerMetrics    *DockerMetrics
 	urlCollectors    []*URLCollector
 	dockerCollectors []*DockerCollector
 	customCollectors []*CustomCollector
 }
 
 func (g *orderedGatherer) Gather() ([]*dto.MetricFamily, error) {
+	// Step 0: Reset all shared GaugeVecs before probing
+	g.dockerMetrics.up.Reset()
+	g.dockerMetrics.cpuPercent.Reset()
+	g.dockerMetrics.memUsage.Reset()
+	g.dockerMetrics.memLimit.Reset()
+	g.urlMetrics.up.Reset()
+	g.urlMetrics.statusCode.Reset()
+	g.urlMetrics.duration.Reset()
+	g.urlMetrics.bodyMatch.Reset()
+	g.urlMetrics.statusMatch.Reset()
+	g.urlMetrics.responseSize.Reset()
+
 	// Step 1: Run all probes (sets GaugeVec values)
 	for _, uc := range g.urlCollectors {
 		uc.Collect()
