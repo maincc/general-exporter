@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -381,35 +382,32 @@ func (c *DockerCollector) cleanName(name string) string {
 }
 
 func (c *DockerCollector) listContainers() ([]DockerContainer, error) {
-	args := []string{"inspect", "--format", "{{json .}}"}
+	var containerNames []string
 	if c.cfg.Mode == "filter" && len(c.cfg.Names) > 0 {
-		args = append(args, c.cfg.Names...)
+		containerNames = c.cfg.Names
 	} else {
 		idCmd := exec.Command("docker", "ps", "-a", "-q")
 		ids, err := idCmd.Output()
 		if err != nil {
 			return nil, err
 		}
-		idList := strings.Fields(strings.TrimSpace(string(ids)))
-		if len(idList) == 0 {
-			return nil, nil
-		}
-		args = append(args, idList...)
+		containerNames = strings.Fields(strings.TrimSpace(string(ids)))
 	}
-	cmd := exec.Command("docker", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
+
+	if len(containerNames) == 0 {
+		return nil, nil
 	}
 
 	var containers []DockerContainer
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		if line == "" {
+	for _, name := range containerNames {
+		cmd := exec.Command("docker", "inspect", "--format", "{{json .}}", name)
+		out, err := cmd.Output()
+		if err != nil {
+			log.Printf("[docker] inspect %s: %v", name, err)
 			continue
 		}
 		var ct DockerContainer
-		if err := json.Unmarshal([]byte(line), &ct); err == nil {
+		if err := json.Unmarshal(bytes.TrimSpace(out), &ct); err == nil {
 			containers = append(containers, ct)
 		}
 	}
