@@ -19,6 +19,13 @@ targets:       # 采集目标列表
 |------|--------|------|
 | `port` | `8080` | 服务端口 |
 | `metrics_path` | `/metrics` | 指标端点路径 |
+| `max_concurrent` | `10` | URL/Docker/脚本采集最大并发数（防止资源耗尽） |
+
+### 新增端点
+
+| 路径 | 说明 |
+|------|------|
+| `/config` | 返回当前加载的配置（JSON），方便调试 |
 
 ---
 
@@ -26,7 +33,7 @@ targets:       # 采集目标列表
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `interval` | `30s` | 采集间隔（预留，当前未生效） |
+| `interval` | `30s` | 采集间隔（每个 target 可覆盖） |
 | `timeout` | `10s` | 请求超时 |
 
 单个 target 可覆盖这些值。
@@ -216,3 +223,18 @@ go build
 ```
 
 访问 `http://localhost:8081/metrics` 查看指标。
+
+### 信号处理
+
+| 信号 | 作用 |
+|------|------|
+| `SIGHUP` | 热加载配置文件，无需重启 |
+| `SIGTERM/SIGINT` | 优雅关闭，停止后台采集后退出 |
+
+```bash
+# 不中断服务地重新加载配置
+kill -HUP $(pgrep -f general-exporter)
+
+# 优雅关闭
+kill $(pgrep -f general-exporter)
+```

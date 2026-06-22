@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
@@ -30,13 +33,15 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port        int    `yaml:"port"`
-	MetricsPath string `yaml:"metrics_path"`
+	Port          int    `yaml:"port"`
+	MetricsPath   string `yaml:"metrics_path"`
+	MaxConcurrent int    `yaml:"max_concurrent"`
 }
 
 type DefaultConfig struct {
-	Interval string `yaml:"interval"`
-	Timeout  string `yaml:"timeout"`
+	Interval       string `yaml:"interval"`        // HTTP timeout for URL checks
+	Timeout        string `yaml:"timeout"`         // same as Interval, kept for backward compatibility
+	ScrapeInterval string `yaml:"scrape_interval"` // how often to run the background scraper
 }
 
 type TargetConfig struct {
@@ -52,6 +57,7 @@ type TargetConfig struct {
 	Interval       string            `yaml:"interval"`
 	Script         string            `yaml:"script"`
 	Labels         map[string]string `yaml:"labels"`
+	MaxBodySize    int               `yaml:"max_body_size"` // maximum bytes to read from response body (0 = unlimited)
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -63,10 +69,10 @@ func loadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	// Apply defaults
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
 	}
-	// 环境变量优先（方便 Docker 部署）
 	if portEnv := os.Getenv("EXPORTER_PORT"); portEnv != "" {
 		if p, err := strconv.Atoi(portEnv); err == nil && p > 0 {
 			cfg.Server.Port = p
@@ -75,13 +81,45 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Server.MetricsPath == "" {
 		cfg.Server.MetricsPath = "/metrics"
 	}
+	if cfg.Server.MaxConcurrent == 0 {
+		cfg.Server.MaxConcurrent = 10
+	}
 	if cfg.Defaults.Interval == "" {
-		cfg.Defaults.Interval = "30s"
+		cfg.Defaults.Interval = "10s"
 	}
 	if cfg.Defaults.Timeout == "" {
-		cfg.Defaults.Timeout = "10s"
+		cfg.Defaults.Timeout = cfg.Defaults.Interval
+	}
+	if cfg.Defaults.ScrapeInterval == "" {
+		cfg.Defaults.ScrapeInterval = "5s"
+	}
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
 	}
 	return &cfg, nil
+}
+
+func validateConfig(cfg *Config) error {
+	for i, t := range cfg.Targets {
+		if t.Name == "" {
+			return fmt.Errorf("target %d: missing 'name'", i)
+		}
+		switch t.Type {
+		case "url":
+			if t.URL == "" {
+				return fmt.Errorf("target %s: missing 'url'", t.Name)
+			}
+		case "docker":
+			// no mandatory fields beyond name
+		case "custom":
+			if t.Script == "" {
+				return fmt.Errorf("target %s: missing 'script'", t.Name)
+			}
+		default:
+			return fmt.Errorf("target %s: unknown type %q", t.Name, t.Type)
+		}
+	}
+	return nil
 }
 
 func parseDuration(s string, fallback string) time.Duration {
@@ -155,6 +193,48 @@ func NewDockerMetrics() *DockerMetrics {
 	}
 }
 
+// ==================== Custom Metric Registry (global) ====================
+
+type CustomMetricRegistry struct {
+	mu     sync.Mutex
+	gauges map[string]*prometheus.GaugeVec
+	reg    *prometheus.Registry
+}
+
+func NewCustomMetricRegistry(reg *prometheus.Registry) *CustomMetricRegistry {
+	return &CustomMetricRegistry{
+		gauges: make(map[string]*prometheus.GaugeVec),
+		reg:    reg,
+	}
+}
+
+// GetOrCreateGauge returns a GaugeVec for the given metric name, creating it if needed.
+// All instances share the same GaugeVec, differentiated by labels.
+func (r *CustomMetricRegistry) GetOrCreateGauge(name string) *prometheus.GaugeVec {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if g, ok := r.gauges[name]; ok {
+		return g
+	}
+	labels := []string{"name", "env", "tier"}
+	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: name,
+		Help: "Custom metric from script",
+	}, labels)
+	r.reg.MustRegister(g)
+	r.gauges[name] = g
+	return g
+}
+
+// ResetAll resets all custom metrics before a new scrape.
+func (r *CustomMetricRegistry) ResetAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, g := range r.gauges {
+		g.Reset()
+	}
+}
+
 // ==================== URL Collector ====================
 
 type URLCollector struct {
@@ -168,14 +248,6 @@ func NewURLCollector(cfg TargetConfig, defaults DefaultConfig, m *URLMetrics) *U
 }
 
 func (c *URLCollector) Collect() {
-	// Reset stale metrics before each scrape
-	c.metrics.up.Reset()
-	c.metrics.statusCode.Reset()
-	c.metrics.duration.Reset()
-	c.metrics.bodyMatch.Reset()
-	c.metrics.statusMatch.Reset()
-	c.metrics.responseSize.Reset()
-
 	timeout := parseDuration(c.defaults.Timeout, "10s")
 	lv := prometheus.Labels{
 		"name": c.cfg.Name,
@@ -195,7 +267,9 @@ func (c *URLCollector) Collect() {
 		}
 	}
 
-	req, err := http.NewRequest(method, c.cfg.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, c.cfg.URL, nil)
 	if err != nil {
 		c.metrics.up.With(lv).Set(0)
 		return
@@ -215,11 +289,26 @@ func (c *URLCollector) Collect() {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	// Limit body size to prevent memory exhaustion
+	maxSize := c.cfg.MaxBodySize
+	if maxSize <= 0 {
+		maxSize = 10 * 1024 // default 10KB
+	}
+	limitedReader := io.LimitReader(resp.Body, int64(maxSize)+1) // +1 to detect truncation
+	body, err := io.ReadAll(limitedReader)
+	if err != nil {
+		// still set status and up, but body may be partial
+		log.Printf("[url:%s] error reading body: %v", c.cfg.Name, err)
+	}
+	bodyLen := len(body)
+	if bodyLen > maxSize {
+		body = body[:maxSize] // truncate for matching
+	}
+
 	c.metrics.up.With(lv).Set(1)
 	c.metrics.statusCode.With(lv).Set(float64(resp.StatusCode))
 	c.metrics.duration.With(lv).Set(duration)
-	c.metrics.responseSize.With(lv).Set(float64(len(body)))
+	c.metrics.responseSize.With(lv).Set(float64(bodyLen))
 
 	if c.cfg.ExpectedStatus > 0 {
 		match := 0
@@ -240,10 +329,10 @@ func (c *URLCollector) Collect() {
 // ==================== Docker Collector ====================
 
 type DockerContainer struct {
-	ID     string        `json:"Id"`
-	Name   string        `json:"Name"`
-	State  DockerState   `json:"State"`
-	Image  string        `json:"Image"`
+	ID    string      `json:"Id"`
+	Name  string      `json:"Name"`
+	State DockerState `json:"State"`
+	Image string      `json:"Image"`
 }
 
 type DockerState struct {
@@ -255,79 +344,6 @@ type DockerCollector struct {
 	metrics *DockerMetrics
 }
 
-// ==================== Custom (Script) Collector ====================
-
-type CustomCollector struct {
-	cfg      TargetConfig
-	defaults DefaultConfig
-	gauges   map[string]*prometheus.GaugeVec
-	mu       sync.Mutex
-	reg      *prometheus.Registry
-}
-
-func NewCustomCollector(cfg TargetConfig, defaults DefaultConfig, reg *prometheus.Registry) *CustomCollector {
-	return &CustomCollector{
-		cfg: cfg, defaults: defaults, reg: reg,
-		gauges: make(map[string]*prometheus.GaugeVec),
-	}
-}
-
-func (c *CustomCollector) getOrCreateGauge(name string) *prometheus.GaugeVec {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if g, ok := c.gauges[name]; ok {
-		return g
-	}
-	labels := []string{"name", "env", "tier"}
-	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: name,
-		Help: "Custom metric from script: " + c.cfg.Name,
-	}, labels)
-	c.gauges[name] = g
-	c.reg.MustRegister(g)
-	return g
-}
-
-func (c *CustomCollector) Collect() {
-	c.mu.Lock()
-	for _, g := range c.gauges {
-		g.Reset()
-	}
-	c.mu.Unlock()
-
-	lv := prometheus.Labels{
-		"name": c.cfg.Name,
-		"env":  c.cfg.Labels["env"],
-		"tier": c.cfg.Labels["tier"],
-	}
-
-	cmd := exec.Command("sh", "-c", c.cfg.Script)
-	cmd.Env = append(os.Environ(), "TARGET_NAME="+c.cfg.Name)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("[custom:%s] script error: %v\n%s", c.cfg.Name, err, string(out))
-		return
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		value, err := strconv.ParseFloat(fields[1], 64)
-		if err != nil {
-			log.Printf("[custom:%s] parse error on %q: %v", c.cfg.Name, line, err)
-			continue
-		}
-		c.getOrCreateGauge(fields[0]).With(lv).Set(value)
-	}
-}
-
 func NewDockerCollector(cfg TargetConfig, m *DockerMetrics) *DockerCollector {
 	return &DockerCollector{cfg: cfg, metrics: m}
 }
@@ -335,7 +351,7 @@ func NewDockerCollector(cfg TargetConfig, m *DockerMetrics) *DockerCollector {
 func (c *DockerCollector) Collect() {
 	containers, err := c.listContainers()
 	if err != nil {
-		log.Printf("[docker] list containers: %v", err)
+		log.Printf("[docker:%s] list containers: %v", c.cfg.Name, err)
 		return
 	}
 
@@ -354,15 +370,9 @@ func (c *DockerCollector) Collect() {
 		if state == "running" {
 			stats, err := c.getContainerStats(ct.ID)
 			if err == nil && stats != nil {
-				if stats.cpuPercent > 0 {
-					c.metrics.cpuPercent.WithLabelValues(lv...).Set(stats.cpuPercent)
-				}
-				if stats.memUsage > 0 {
-					c.metrics.memUsage.WithLabelValues(lv...).Set(stats.memUsage)
-				}
-				if stats.memLimit > 0 {
-					c.metrics.memLimit.WithLabelValues(lv...).Set(stats.memLimit)
-				}
+				c.metrics.cpuPercent.WithLabelValues(lv...).Set(stats.cpuPercent)
+				c.metrics.memUsage.WithLabelValues(lv...).Set(stats.memUsage)
+				c.metrics.memLimit.WithLabelValues(lv...).Set(stats.memLimit)
 			}
 		}
 	}
@@ -392,16 +402,40 @@ func (c *DockerCollector) listContainers() ([]DockerContainer, error) {
 		return nil, nil
 	}
 
+	// Batch inspect
+	args := append([]string{"inspect", "--format", "{{json .}}"}, containerNames...)
+	cmd := exec.Command("docker", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("[docker:%s] batch inspect failed, trying one-by-one: %v", c.cfg.Name, err)
+		return c.inspectOneByOne(containerNames)
+	}
+
 	var containers []DockerContainer
-	for _, name := range containerNames {
-		cmd := exec.Command("docker", "inspect", "--format", "{{json .}}", name)
-		out, err := cmd.Output()
-		if err != nil {
-			log.Printf("[docker] inspect %s: %v", name, err)
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		var ct DockerContainer
-		if err := json.Unmarshal(bytes.TrimSpace(out), &ct); err == nil {
+		if err := json.Unmarshal([]byte(line), &ct); err == nil {
+			containers = append(containers, ct)
+		}
+	}
+	return containers, nil
+}
+
+func (c *DockerCollector) inspectOneByOne(names []string) ([]DockerContainer, error) {
+	var containers []DockerContainer
+	for _, name := range names {
+		cmd := exec.Command("docker", "inspect", "--format", "{{json .}}", name)
+		out, err := cmd.Output()
+		if err != nil {
+			log.Printf("[docker:%s] inspect %s: %v", c.cfg.Name, name, err)
+			continue
+		}
+		var ct DockerContainer
+		if err := json.Unmarshal(out, &ct); err == nil {
 			containers = append(containers, ct)
 		}
 	}
@@ -415,55 +449,344 @@ type dockerStats struct {
 }
 
 func (c *DockerCollector) getContainerStats(id string) (*dockerStats, error) {
-	cmd := exec.Command("docker", "stats", "--no-stream", "--format",
-		"{{.CPUPerc}}\t{{.MemUsage}}", id)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "stats", "--no-stream",
+		"--format", `{{json .}}`, id)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	parts := strings.Split(strings.TrimSpace(string(out)), "\t")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("unexpected stats format")
+
+	// JSON parsing (Docker 20.10+)
+	var raw struct {
+		CPUPerc  string `json:"CPUPerc"`
+		MemUsage string `json:"MemUsage"`
 	}
-	stats := &dockerStats{}
-	cpuStr := strings.TrimSuffix(parts[0], "%")
-	if v, err := strconv.ParseFloat(cpuStr, 64); err == nil {
-		stats.cpuPercent = v
+	if err := json.Unmarshal(bytes.TrimSpace(out), &raw); err == nil && raw.CPUPerc != "" {
+		stats := &dockerStats{}
+		cpuStr := strings.TrimSuffix(raw.CPUPerc, "%")
+		if v, err := strconv.ParseFloat(cpuStr, 64); err == nil {
+			stats.cpuPercent = v
+		}
+		memParts := strings.Split(raw.MemUsage, "/")
+		if len(memParts) >= 1 {
+			stats.memUsage = parseBytes(strings.TrimSpace(memParts[0]))
+		}
+		if len(memParts) >= 2 {
+			stats.memLimit = parseBytes(strings.TrimSpace(memParts[1]))
+		}
+		return stats, nil
 	}
-	memParts := strings.Split(parts[1], "/")
-	if len(memParts) >= 1 {
-		stats.memUsage = parseBytes(strings.TrimSpace(memParts[0]))
-	}
-	if len(memParts) >= 2 {
-		stats.memLimit = parseBytes(strings.TrimSpace(memParts[1]))
-	}
-	return stats, nil
+
+	return nil, fmt.Errorf("unable to parse stats JSON from docker")
 }
 
+// parseBytes parses Docker-style human-readable byte strings like "113.2MiB", "19.63GiB", "1.5GB", "256B".
+// Order matters: longer suffixes must be checked first, otherwise "MiB" matches "B" and fails.
 func parseBytes(s string) float64 {
-	s = strings.ToUpper(strings.TrimSpace(s))
-	var multiplier float64 = 1
-	switch {
-	case strings.HasSuffix(s, "GIB"):
-		multiplier = 1024 * 1024 * 1024
-		s = strings.TrimSuffix(s, "GIB")
-	case strings.HasSuffix(s, "MIB"):
-		multiplier = 1024 * 1024
-		s = strings.TrimSuffix(s, "MIB")
-	case strings.HasSuffix(s, "KIB"):
-		multiplier = 1024
-		s = strings.TrimSuffix(s, "KIB")
-	case strings.HasSuffix(s, "B"):
-		s = strings.TrimSuffix(s, "B")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
 	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+
+	// Ordered from longest suffix to shortest so "MiB" matches before "B"
+	type unit struct {
+		suffix string
+		mult   float64
+	}
+	units := []unit{
+		{"TiB", 1 << 40},
+		{"GiB", 1 << 30},
+		{"MiB", 1 << 20},
+		{"KiB", 1 << 10},
+		{"GB", 1000 * 1000 * 1000},
+		{"MB", 1000 * 1000},
+		{"KB", 1000},
+		{"B", 1},
+	}
+
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			numStr := strings.TrimSuffix(s, u.suffix)
+			num, err := strconv.ParseFloat(strings.TrimSpace(numStr), 64)
+			if err != nil {
+				return 0
+			}
+			return num * u.mult
+		}
+	}
+
+	// No unit -> assume bytes
+	num, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0
 	}
-	return v * multiplier
+	return num
+}
+
+// ==================== Custom (Script) Collector ====================
+
+type CustomCollector struct {
+	cfg      TargetConfig
+	defaults DefaultConfig
+	reg      *CustomMetricRegistry // global registry
+}
+
+func NewCustomCollector(cfg TargetConfig, defaults DefaultConfig, reg *CustomMetricRegistry) *CustomCollector {
+	return &CustomCollector{
+		cfg: cfg, defaults: defaults, reg: reg,
+	}
+}
+
+func (c *CustomCollector) Collect() {
+	lv := prometheus.Labels{
+		"name": c.cfg.Name,
+		"env":  c.cfg.Labels["env"],
+		"tier": c.cfg.Labels["tier"],
+	}
+
+	// Use context with timeout to prevent hung scripts
+	timeout := parseDuration(c.defaults.Timeout, "30s")
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", c.cfg.Script)
+	cmd.Env = append(os.Environ(), "TARGET_NAME="+c.cfg.Name)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("[custom:%s] script TIMEOUT (%v exceeded)", c.cfg.Name, timeout)
+		} else {
+			log.Printf("[custom:%s] script error: %v\n%s", c.cfg.Name, err, string(out))
+		}
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		value, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			log.Printf("[custom:%s] parse error on %q: %v", c.cfg.Name, line, err)
+			continue
+		}
+		gauge := c.reg.GetOrCreateGauge(fields[0])
+		gauge.With(lv).Set(value)
+	}
+}
+
+// ==================== Snapshot Gatherer ====================
+
+type snapshotGatherer struct {
+	mu       sync.RWMutex
+	snapshot []*dto.MetricFamily
+}
+
+func (g *snapshotGatherer) Gather() ([]*dto.MetricFamily, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.snapshot == nil {
+		return nil, nil
+	}
+	return g.snapshot, nil
+}
+
+func (g *snapshotGatherer) Swap(mf []*dto.MetricFamily) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.snapshot = mf
+}
+
+// ==================== Background Scraper ====================
+
+type BackgroundScraper struct {
+	mu               sync.RWMutex // protects collector slices
+	urlCollectors    []*URLCollector
+	dockerCollectors []*DockerCollector
+	customCollectors []*CustomCollector
+	urlMetrics       *URLMetrics
+	dockerMetrics    *DockerMetrics
+	customReg        *CustomMetricRegistry
+	metricsReg       *prometheus.Registry
+	mainReg          *prometheus.Registry
+	snap             *snapshotGatherer
+	stopCh           chan struct{}
+	maxConcurrent    int
+	scrapeInterval   time.Duration
+}
+
+func NewBackgroundScraper(
+	urlCollectors []*URLCollector,
+	dockerCollectors []*DockerCollector,
+	customCollectors []*CustomCollector,
+	urlMetrics *URLMetrics,
+	dockerMetrics *DockerMetrics,
+	customReg *CustomMetricRegistry,
+	metricsReg *prometheus.Registry,
+	mainReg *prometheus.Registry,
+	snap *snapshotGatherer,
+	maxConcurrent int,
+	scrapeInterval time.Duration,
+) *BackgroundScraper {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 10
+	}
+	return &BackgroundScraper{
+		urlCollectors:    urlCollectors,
+		dockerCollectors: dockerCollectors,
+		customCollectors: customCollectors,
+		urlMetrics:       urlMetrics,
+		dockerMetrics:    dockerMetrics,
+		customReg:        customReg,
+		metricsReg:       metricsReg,
+		mainReg:          mainReg,
+		snap:             snap,
+		stopCh:           make(chan struct{}),
+		maxConcurrent:    maxConcurrent,
+		scrapeInterval:   scrapeInterval,
+	}
+}
+
+// Update atomically replaces the collector lists.
+func (s *BackgroundScraper) Update(
+	urlCollectors []*URLCollector,
+	dockerCollectors []*DockerCollector,
+	customCollectors []*CustomCollector,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.urlCollectors = urlCollectors
+	s.dockerCollectors = dockerCollectors
+	s.customCollectors = customCollectors
+	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d",
+		len(urlCollectors), len(dockerCollectors), len(customCollectors))
+}
+
+func (s *BackgroundScraper) scrapeOnce() {
+	// Reset all metrics before collection
+	s.urlMetrics.up.Reset()
+	s.urlMetrics.statusCode.Reset()
+	s.urlMetrics.duration.Reset()
+	s.urlMetrics.bodyMatch.Reset()
+	s.urlMetrics.statusMatch.Reset()
+	s.urlMetrics.responseSize.Reset()
+	s.dockerMetrics.up.Reset()
+	s.dockerMetrics.cpuPercent.Reset()
+	s.dockerMetrics.memUsage.Reset()
+	s.dockerMetrics.memLimit.Reset()
+	s.customReg.ResetAll() // reset all custom metrics
+
+	// Snapshot current collector lists
+	s.mu.RLock()
+	urls := s.urlCollectors
+	dockers := s.dockerCollectors
+	customs := s.customCollectors
+	s.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, s.maxConcurrent)
+
+	for _, uc := range urls {
+		wg.Add(1)
+		go func(c *URLCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			c.Collect()
+			<-sem
+		}(uc)
+	}
+
+	for _, dc := range dockers {
+		wg.Add(1)
+		go func(c *DockerCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			c.Collect()
+			<-sem
+		}(dc)
+	}
+
+	for _, cc := range customs {
+		wg.Add(1)
+		go func(c *CustomCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			c.Collect()
+			<-sem
+		}(cc)
+	}
+
+	wg.Wait()
+
+	// Atomically swap snapshot
+	mf1, _ := s.metricsReg.Gather()
+	mf2, _ := s.mainReg.Gather()
+	all := append(mf1, mf2...)
+	s.snap.Swap(all)
+}
+
+func (s *BackgroundScraper) Run() {
+	log.Printf("[scraper] starting background scrape every %v", s.scrapeInterval)
+
+	// Immediate first scrape
+	s.scrapeOnce()
+
+	ticker := time.NewTicker(s.scrapeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.scrapeOnce()
+		case <-s.stopCh:
+			log.Println("[scraper] stopped")
+			return
+		}
+	}
+}
+
+func (s *BackgroundScraper) Stop() {
+	close(s.stopCh)
 }
 
 // ==================== Main ====================
+
+func buildCollectors(
+	cfg *Config,
+	urlMetrics *URLMetrics,
+	dockerMetrics *DockerMetrics,
+	customReg *CustomMetricRegistry,
+) ([]*URLCollector, []*DockerCollector, []*CustomCollector) {
+	var urlCollectors []*URLCollector
+	var dockerCollectors []*DockerCollector
+	var customCollectors []*CustomCollector
+
+	for _, t := range cfg.Targets {
+		switch t.Type {
+		case "url":
+			log.Printf("Registering URL collector: %s -> %s", t.Name, t.URL)
+			urlCollectors = append(urlCollectors, NewURLCollector(t, cfg.Defaults, urlMetrics))
+		case "docker":
+			log.Printf("Registering Docker collector: %s (mode=%s)", t.Name, t.Mode)
+			dockerCollectors = append(dockerCollectors, NewDockerCollector(t, dockerMetrics))
+		case "custom":
+			log.Printf("Registering Custom collector: %s (script=%s)", t.Name, t.Script)
+			customCollectors = append(customCollectors, NewCustomCollector(t, cfg.Defaults, customReg))
+		default:
+			log.Printf("WARNING: unknown target type %q, skipping %s", t.Type, t.Name)
+		}
+	}
+	return urlCollectors, dockerCollectors, customCollectors
+}
 
 func main() {
 	configPath := "config.yaml"
@@ -482,107 +805,90 @@ func main() {
 	}
 	log.Printf("Loaded config: %d targets", len(cfg.Targets))
 
-	// Separate registries for ordering control
-	metricsReg := prometheus.NewRegistry()    // GaugeVec metrics
-	mainReg := prometheus.NewRegistry()        // Go + process collectors
+	// Separate registries: one for our metrics, one for go/process
+	metricsReg := prometheus.NewRegistry()
+	mainReg := prometheus.NewRegistry()
 	mainReg.MustRegister(prometheus.NewGoCollector())
 	mainReg.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 
 	urlMetrics := NewURLMetrics()
 	dockerMetrics := NewDockerMetrics()
+	customReg := NewCustomMetricRegistry(metricsReg)
 
-	// Register GaugeVecs to metricsReg
 	metricsReg.MustRegister(urlMetrics.up, urlMetrics.statusCode, urlMetrics.duration,
 		urlMetrics.bodyMatch, urlMetrics.statusMatch, urlMetrics.responseSize)
 	metricsReg.MustRegister(dockerMetrics.up, dockerMetrics.cpuPercent,
 		dockerMetrics.memUsage, dockerMetrics.memLimit)
+	// Custom metrics are registered dynamically via customReg
 
-	var urlCollectors []*URLCollector
-	var dockerCollectors []*DockerCollector
-	var customCollectors []*CustomCollector
+	// Initial build of collectors
+	urlCollectors, dockerCollectors, customCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg)
 
-	for _, t := range cfg.Targets {
-		switch t.Type {
-		case "url":
-			log.Printf("Registering URL collector: %s -> %s", t.Name, t.URL)
-			urlCollectors = append(urlCollectors, NewURLCollector(t, cfg.Defaults, urlMetrics))
-		case "docker":
-			log.Printf("Registering Docker collector: %s (mode=%s)", t.Name, t.Mode)
-			dockerCollectors = append(dockerCollectors, NewDockerCollector(t, dockerMetrics))
-		case "custom":
-			log.Printf("Registering Custom collector: %s (script=%s)", t.Name, t.Script)
-			customCollectors = append(customCollectors, NewCustomCollector(t, cfg.Defaults, metricsReg))
-		default:
-			log.Printf("WARNING: unknown target type %q, skipping %s", t.Type, t.Name)
-		}
-	}
+	// Snapshot gatherer
+	snap := &snapshotGatherer{}
 
-	gatherer := &orderedGatherer{
-		metricsReg:       metricsReg,
-		mainReg:          mainReg,
-		urlMetrics:       urlMetrics,
-		dockerMetrics:    dockerMetrics,
-		urlCollectors:    urlCollectors,
-		dockerCollectors: dockerCollectors,
-		customCollectors: customCollectors,
-	}
+	scrapeInterval := parseDuration(cfg.Defaults.ScrapeInterval, "5s")
+	scraper := NewBackgroundScraper(
+		urlCollectors, dockerCollectors, customCollectors,
+		urlMetrics, dockerMetrics, customReg,
+		metricsReg, mainReg, snap,
+		cfg.Server.MaxConcurrent,
+		scrapeInterval,
+	)
+	go scraper.Run()
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
-	log.Printf("Server starting on %s (metrics: %s)", addr, cfg.Server.MetricsPath)
+	log.Printf("Server starting on %s (metrics: %s, pid: %d)", addr, cfg.Server.MetricsPath, os.Getpid())
+	log.Printf("Send SIGHUP to reload config, SIGTERM to graceful shutdown")
 
-	http.Handle(cfg.Server.MetricsPath, promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{
+	http.Handle(cfg.Server.MetricsPath, promhttp.HandlerFor(snap, promhttp.HandlerOpts{
 		EnableOpenMetrics: true,
 	}))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "OK - %d targets registered\n", len(cfg.Targets))
 	})
-	log.Fatal(http.ListenAndServe(addr, nil))
-}
+	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(cfg)
+	})
 
-// orderedGatherer runs probes first, then gathers all metrics
-type orderedGatherer struct {
-	metricsReg       *prometheus.Registry
-	mainReg          *prometheus.Registry
-	urlMetrics       *URLMetrics
-	dockerMetrics    *DockerMetrics
-	urlCollectors    []*URLCollector
-	dockerCollectors []*DockerCollector
-	customCollectors []*CustomCollector
-}
+	srv := &http.Server{Addr: addr}
 
-func (g *orderedGatherer) Gather() ([]*dto.MetricFamily, error) {
-	// Step 0: Reset all shared GaugeVecs before probing
-	g.dockerMetrics.up.Reset()
-	g.dockerMetrics.cpuPercent.Reset()
-	g.dockerMetrics.memUsage.Reset()
-	g.dockerMetrics.memLimit.Reset()
-	g.urlMetrics.up.Reset()
-	g.urlMetrics.statusCode.Reset()
-	g.urlMetrics.duration.Reset()
-	g.urlMetrics.bodyMatch.Reset()
-	g.urlMetrics.statusMatch.Reset()
-	g.urlMetrics.responseSize.Reset()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-	// Step 1: Run all probes (sets GaugeVec values)
-	for _, uc := range g.urlCollectors {
-		uc.Collect()
-	}
-	for _, dc := range g.dockerCollectors {
-		dc.Collect()
-	}
-	for _, cc := range g.customCollectors {
-		cc.Collect()
-	}
+	go func() {
+		for sig := range sigCh {
+			switch sig {
+			case syscall.SIGHUP:
+				log.Println("[config] SIGHUP received, reloading...")
+				newCfg, err := loadConfig(configPath)
+				if err != nil {
+					log.Printf("[config] reload failed: %v", err)
+					continue
+				}
+				// Rebuild collectors with new config
+				newURL, newDocker, newCustom := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg)
+				// Atomically update the scraper
+				scraper.Update(newURL, newDocker, newCustom)
+				cfg = newCfg // update global config for /config endpoint
+				log.Printf("[config] reloaded: %d targets", len(cfg.Targets))
 
-	// Step 2: Gather metrics
-	mf1, err := g.metricsReg.Gather()
-	if err != nil {
-		return mf1, err
+			case syscall.SIGTERM, syscall.SIGINT:
+				log.Println("[server] shutting down...")
+				scraper.Stop()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = srv.Shutdown(ctx)
+				os.Exit(0)
+			}
+		}
+	}()
+
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("Server error: %v", err)
 	}
-	mf2, err := g.mainReg.Gather()
-	if err != nil {
-		return append(mf1, mf2...), nil
-	}
-	return append(mf1, mf2...), nil
 }
