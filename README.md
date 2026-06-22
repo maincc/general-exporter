@@ -37,8 +37,21 @@ cp config.yaml.example config.yaml
 |------|------|
 | `http://localhost:8081/metrics` | Prometheus 指标 |
 | `http://localhost:8081/health` | 健康检查 |
+| `http://localhost:8081/config` | 当前配置（JSON） |
 
 默认端口 8081，可在 `config.yaml` 中修改。
+
+## 信号处理
+
+| 信号 | 作用 |
+|------|------|
+| `SIGHUP` | 热加载配置，无需重启 |
+| `SIGTERM` | 优雅关闭 |
+
+```bash
+kill -HUP $(pgrep -f general-exporter)  # 热加载
+kill $(pgrep -f general-exporter)        # 优雅关闭
+```
 
 ## 配置示例
 

@@ -2,7 +2,10 @@ version: '3.8'
 
 services:
   general-exporter:
-    build: .
+    build:
+      context: .
+      args:
+        EXPORTER_PORT: ${EXPORTER_PORT:-8081}
     container_name: general-exporter
     ports:
       - "${EXPORTER_PORT:-8081}:${EXPORTER_PORT:-8081}"

@@ -12,5 +12,6 @@ WORKDIR /app
 COPY --from=builder /build/general-exporter .
 COPY config.yaml .
 RUN chmod +x general-exporter
-EXPOSE 8081
+ARG EXPORTER_PORT=8081
+EXPOSE ${EXPORTER_PORT}
 ENTRYPOINT ["./general-exporter"]
