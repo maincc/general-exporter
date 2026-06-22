@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  general-exporter:
+    build:
+      context: .
+      args:
+        EXPORTER_PORT: ${EXPORTER_PORT:-8081}
+    container_name: general-exporter
+    ports:
+      - "${EXPORTER_PORT:-8081}:${EXPORTER_PORT:-8081}"
+    environment:
+      - EXPORTER_PORT=${EXPORTER_PORT:-8081}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 如需外部修改配置，取消注释
+      # - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped

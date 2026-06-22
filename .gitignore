@@ -7,6 +7,9 @@
 general-exporter
 /exporter
 
+# Backup files
+*.bak
+
 # Test binary
 *.test
 
@@ -31,3 +34,4 @@ go.work.sum
 .DS_Store
 
 config.yaml
+.env
