@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # JCC 链上账户余额查询脚本
 # 用于 general-exporter custom collector
 # 输出格式: 指标名 数值
@@ -29,6 +29,6 @@ if [ -z "$BALANCE" ]; then
 fi
 
 echo "jcc_balance_up 1"
-# echo "jcc_balance_drop $BALANCE"
+echo "swtc_balance $BALANCE"
 # echo "jcc_sequence $SEQUENCE"
 # echo "jcc_ledger_index $LEDGER"

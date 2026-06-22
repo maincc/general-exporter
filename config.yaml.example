@@ -48,7 +48,7 @@ targets:
   # ==================== 自定义脚本 ====================
   # - name: "skywell_node"
   #   type: custom
-  #   script: "/opt/scripts/skywell-stats.sh"
+  #   script: "/app/scripts/skywell-stats.sh"
   #   labels:
   #     env: "prod"
   #     tier: "node"
