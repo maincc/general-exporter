@@ -21,6 +21,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -59,6 +60,12 @@ type TargetConfig struct {
 	Script         string            `yaml:"script"`
 	Labels         map[string]string `yaml:"labels"`
 	MaxBodySize    int               `yaml:"max_body_size"` // maximum bytes to read from response body (0 = unlimited)
+	Remote         *RemoteTarget     `yaml:"remote"`        // remote metrics endpoint (type=remote)
+}
+
+type RemoteTarget struct {
+	URL     string            `yaml:"url"`
+	Headers map[string]string `yaml:"headers"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -116,6 +123,10 @@ func validateConfig(cfg *Config) error {
 		case "custom":
 			if t.Script == "" {
 				return fmt.Errorf("target %s: missing 'script'", t.Name)
+			}
+		case "remote":
+			if t.Remote == nil || t.Remote.URL == "" {
+				return fmt.Errorf("target %s: missing 'remote.url'", t.Name)
 			}
 		default:
 			return fmt.Errorf("target %s: unknown type %q", t.Name, t.Type)
@@ -198,15 +209,17 @@ func NewDockerMetrics() *DockerMetrics {
 // ==================== Custom Metric Registry (global) ====================
 
 type CustomMetricRegistry struct {
-	mu     sync.Mutex
-	gauges map[string]*prometheus.GaugeVec
-	reg    *prometheus.Registry
+	mu         sync.Mutex
+	gauges     map[string]*prometheus.GaugeVec
+	reg        *prometheus.Registry
+	seenNames  map[string]bool // track metric names seen in current round
 }
 
 func NewCustomMetricRegistry(reg *prometheus.Registry) *CustomMetricRegistry {
 	return &CustomMetricRegistry{
-		gauges: make(map[string]*prometheus.GaugeVec),
-		reg:    reg,
+		gauges:    make(map[string]*prometheus.GaugeVec),
+		reg:       reg,
+		seenNames: make(map[string]bool),
 	}
 }
 
@@ -216,6 +229,7 @@ func (r *CustomMetricRegistry) GetOrCreateGauge(name string) *prometheus.GaugeVe
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if g, ok := r.gauges[name]; ok {
+		r.seenNames[name] = true
 		return g
 	}
 	labels := []string{"name", "env", "tier"}
@@ -225,15 +239,29 @@ func (r *CustomMetricRegistry) GetOrCreateGauge(name string) *prometheus.GaugeVe
 	}, labels)
 	r.reg.MustRegister(g)
 	r.gauges[name] = g
+	r.seenNames[name] = true
 	return g
 }
 
-// ResetAll resets all custom metrics before a new scrape.
+// ResetAll resets all custom metrics and clears seen names before a new scrape.
 func (r *CustomMetricRegistry) ResetAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, g := range r.gauges {
 		g.Reset()
+	}
+	r.seenNames = make(map[string]bool)
+}
+
+// PurgeStale unregisters GaugeVecs whose names were NOT seen in the current round.
+func (r *CustomMetricRegistry) PurgeStale() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, g := range r.gauges {
+		if !r.seenNames[name] {
+			r.reg.Unregister(g)
+			delete(r.gauges, name)
+		}
 	}
 }
 
@@ -586,11 +614,68 @@ func (c *CustomCollector) Collect() {
 	}
 }
 
+// ==================== Remote Collector ====================
+
+type RemoteCollector struct {
+	cfg      TargetConfig
+	defaults DefaultConfig
+	timeout  time.Duration
+}
+
+func NewRemoteCollector(cfg TargetConfig, defaults DefaultConfig) *RemoteCollector {
+	return &RemoteCollector{cfg: cfg, defaults: defaults, timeout: parseDuration(defaults.Timeout, "30s")}
+}
+
+// Collect fetches remote /metrics text and parses it into MetricFamilies.
+func (c *RemoteCollector) Collect() []*dto.MetricFamily {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.cfg.Remote.URL, nil)
+	if err != nil {
+		log.Printf("[remote:%s] create request: %v", c.cfg.Name, err)
+		return nil
+	}
+	for k, v := range c.cfg.Remote.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[remote:%s] fetch failed: %v", c.cfg.Name, err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[remote:%s] non-200 status: %d", c.cfg.Name, resp.StatusCode)
+		return nil
+	}
+
+	parser := expfmt.NewDecoder(resp.Body, expfmt.NewFormat(expfmt.TypeTextPlain))
+	var mfs []*dto.MetricFamily
+	for {
+		var mf dto.MetricFamily
+		if err := parser.Decode(&mf); err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("[remote:%s] parse error: %v", c.cfg.Name, err)
+			break
+		}
+		mfs = append(mfs, &mf)
+	}
+	log.Printf("[remote:%s] fetched %d metric families", c.cfg.Name, len(mfs))
+	return mfs
+}
+
 // ==================== Snapshot Gatherer ====================
 
 type snapshotGatherer struct {
 	mu       sync.RWMutex
 	snapshot []*dto.MetricFamily
+	// Track remote metric names from previous round to prevent stale data
+	remoteNames map[string]bool
 }
 
 func (g *snapshotGatherer) Gather() ([]*dto.MetricFamily, error) {
@@ -608,6 +693,23 @@ func (g *snapshotGatherer) Swap(mf []*dto.MetricFamily) {
 	g.snapshot = mf
 }
 
+// RemoveRemoteByName removes MetricFamilies whose names are in the given set.
+func (g *snapshotGatherer) RemoveRemoteByName(names map[string]bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.snapshot) == 0 || len(names) == 0 {
+		return
+	}
+	filtered := make([]*dto.MetricFamily, 0, len(g.snapshot))
+	for _, mf := range g.snapshot {
+		if mf.Name != nil && names[*mf.Name] {
+			continue
+		}
+		filtered = append(filtered, mf)
+	}
+	g.snapshot = filtered
+}
+
 // ==================== Background Scraper ====================
 
 type BackgroundScraper struct {
@@ -615,6 +717,8 @@ type BackgroundScraper struct {
 	urlCollectors    []*URLCollector
 	dockerCollectors []*DockerCollector
 	customCollectors []*CustomCollector
+	remoteCollectors []*RemoteCollector
+	remotePrevNames  map[string]bool
 	urlMetrics       *URLMetrics
 	dockerMetrics    *DockerMetrics
 	customReg        *CustomMetricRegistry
@@ -630,6 +734,7 @@ func NewBackgroundScraper(
 	urlCollectors []*URLCollector,
 	dockerCollectors []*DockerCollector,
 	customCollectors []*CustomCollector,
+	remoteCollectors []*RemoteCollector,
 	urlMetrics *URLMetrics,
 	dockerMetrics *DockerMetrics,
 	customReg *CustomMetricRegistry,
@@ -646,6 +751,8 @@ func NewBackgroundScraper(
 		urlCollectors:    urlCollectors,
 		dockerCollectors: dockerCollectors,
 		customCollectors: customCollectors,
+		remoteCollectors: remoteCollectors,
+		remotePrevNames:  make(map[string]bool),
 		urlMetrics:       urlMetrics,
 		dockerMetrics:    dockerMetrics,
 		customReg:        customReg,
@@ -663,14 +770,16 @@ func (s *BackgroundScraper) Update(
 	urlCollectors []*URLCollector,
 	dockerCollectors []*DockerCollector,
 	customCollectors []*CustomCollector,
+	remoteCollectors []*RemoteCollector,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.urlCollectors = urlCollectors
 	s.dockerCollectors = dockerCollectors
 	s.customCollectors = customCollectors
-	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d",
-		len(urlCollectors), len(dockerCollectors), len(customCollectors))
+	s.remoteCollectors = remoteCollectors
+	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d, remote=%d",
+		len(urlCollectors), len(dockerCollectors), len(customCollectors), len(remoteCollectors))
 }
 
 func (s *BackgroundScraper) scrapeOnce() {
@@ -692,6 +801,7 @@ func (s *BackgroundScraper) scrapeOnce() {
 	urls := s.urlCollectors
 	dockers := s.dockerCollectors
 	customs := s.customCollectors
+	remotes := s.remoteCollectors
 	s.mu.RUnlock()
 
 	var wg sync.WaitGroup
@@ -727,7 +837,22 @@ func (s *BackgroundScraper) scrapeOnce() {
 		}(cc)
 	}
 
+	// Remote collectors: fetch raw metrics text and parse into MetricFamilies
+	remoteMF := make([][]*dto.MetricFamily, len(remotes))
+	for i, rc := range remotes {
+		wg.Add(1)
+		go func(idx int, c *RemoteCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			remoteMF[idx] = c.Collect()
+			<-sem
+		}(i, rc)
+	}
+
 	wg.Wait()
+
+	// Purge custom gauges that were NOT seen in this round
+	s.customReg.PurgeStale()
 
 	// Atomically swap snapshot
 	mf1, _ := s.metricsReg.Gather()
@@ -736,7 +861,25 @@ func (s *BackgroundScraper) scrapeOnce() {
 		mf2, _ := s.mainReg.Gather()
 		all = append(mf1, mf2...)
 	}
+	// Remove stale remote metrics from previous round
+	s.snap.RemoveRemoteByName(s.remotePrevNames)
+
+	// Append fresh remote metric families
+	for _, rMFs := range remoteMF {
+		if rMFs != nil {
+			all = append(all, rMFs...)
+		}
+	}
 	s.snap.Swap(all)
+	// Track remote metric names for next round stale cleanup
+	s.remotePrevNames = make(map[string]bool)
+	for _, rMFs := range remoteMF {
+		for _, mf := range rMFs {
+			if mf.Name != nil {
+				s.remotePrevNames[*mf.Name] = true
+			}
+		}
+	}
 }
 
 func (s *BackgroundScraper) Run() {
@@ -770,10 +913,11 @@ func buildCollectors(
 	urlMetrics *URLMetrics,
 	dockerMetrics *DockerMetrics,
 	customReg *CustomMetricRegistry,
-) ([]*URLCollector, []*DockerCollector, []*CustomCollector) {
+) ([]*URLCollector, []*DockerCollector, []*CustomCollector, []*RemoteCollector) {
 	var urlCollectors []*URLCollector
 	var dockerCollectors []*DockerCollector
 	var customCollectors []*CustomCollector
+	var remoteCollectors []*RemoteCollector
 
 	for _, t := range cfg.Targets {
 		switch t.Type {
@@ -786,11 +930,14 @@ func buildCollectors(
 		case "custom":
 			log.Printf("Registering Custom collector: %s (script=%s)", t.Name, t.Script)
 			customCollectors = append(customCollectors, NewCustomCollector(t, cfg.Defaults, customReg))
+		case "remote":
+			log.Printf("Registering Remote collector: %s -> %s", t.Name, t.Remote.URL)
+			remoteCollectors = append(remoteCollectors, NewRemoteCollector(t, cfg.Defaults))
 		default:
 			log.Printf("WARNING: unknown target type %q, skipping %s", t.Type, t.Name)
 		}
 	}
-	return urlCollectors, dockerCollectors, customCollectors
+	return urlCollectors, dockerCollectors, customCollectors, remoteCollectors
 }
 
 func main() {
@@ -838,14 +985,14 @@ func main() {
 	// Custom metrics are registered dynamically via customReg
 
 	// Initial build of collectors
-	urlCollectors, dockerCollectors, customCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg)
+	urlCollectors, dockerCollectors, customCollectors, remoteCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg)
 
 	// Snapshot gatherer
 	snap := &snapshotGatherer{}
 
 	scrapeInterval := parseDuration(cfg.Defaults.ScrapeInterval, "5s")
 	scraper := NewBackgroundScraper(
-		urlCollectors, dockerCollectors, customCollectors,
+		urlCollectors, dockerCollectors, customCollectors, remoteCollectors,
 		urlMetrics, dockerMetrics, customReg,
 		metricsReg, passMainReg, snap,
 		cfg.Server.MaxConcurrent,
@@ -887,9 +1034,9 @@ func main() {
 					continue
 				}
 				// Rebuild collectors with new config
-				newURL, newDocker, newCustom := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg)
+				newURL, newDocker, newCustom, newRemote := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg)
 				// Atomically update the scraper
-				scraper.Update(newURL, newDocker, newCustom)
+				scraper.Update(newURL, newDocker, newCustom, newRemote)
 				cfg = newCfg // update global config for /config endpoint
 				log.Printf("[config] reloaded: %d targets", len(cfg.Targets))
 
