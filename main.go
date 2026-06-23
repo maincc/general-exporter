@@ -33,9 +33,10 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port          int    `yaml:"port"`
-	MetricsPath   string `yaml:"metrics_path"`
-	MaxConcurrent int    `yaml:"max_concurrent"`
+	Port                 int    `yaml:"port"`
+	MetricsPath          string `yaml:"metrics_path"`
+	MaxConcurrent        int    `yaml:"max_concurrent"`
+	ExposeRuntimeMetrics *bool `yaml:"expose_runtime_metrics"` // expose Go/Process metrics (default true)
 }
 
 type DefaultConfig struct {
@@ -84,6 +85,7 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Server.MaxConcurrent == 0 {
 		cfg.Server.MaxConcurrent = 10
 	}
+
 	if cfg.Defaults.Interval == "" {
 		cfg.Defaults.Interval = "10s"
 	}
@@ -729,8 +731,11 @@ func (s *BackgroundScraper) scrapeOnce() {
 
 	// Atomically swap snapshot
 	mf1, _ := s.metricsReg.Gather()
-	mf2, _ := s.mainReg.Gather()
-	all := append(mf1, mf2...)
+	all := mf1
+	if s.mainReg != nil {
+		mf2, _ := s.mainReg.Gather()
+		all = append(mf1, mf2...)
+	}
 	s.snap.Swap(all)
 }
 
@@ -805,11 +810,22 @@ func main() {
 	}
 	log.Printf("Loaded config: %d targets", len(cfg.Targets))
 
-	// Separate registries: one for our metrics, one for go/process
+	// Separate registries: one for our metrics, one for go/process (optional)
 	metricsReg := prometheus.NewRegistry()
 	mainReg := prometheus.NewRegistry()
-	mainReg.MustRegister(prometheus.NewGoCollector())
-	mainReg.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	exposeRuntime := cfg.Server.ExposeRuntimeMetrics == nil || *cfg.Server.ExposeRuntimeMetrics // default true
+	if exposeRuntime {
+		mainReg.MustRegister(prometheus.NewGoCollector())
+		mainReg.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+		log.Println("[config] runtime metrics (go/process) enabled")
+	} else {
+		log.Println("[config] runtime metrics (go/process) disabled")
+	}
+	// Pass nil for mainReg when runtime metrics disabled
+	passMainReg := mainReg
+	if !exposeRuntime {
+		passMainReg = nil
+	}
 
 	urlMetrics := NewURLMetrics()
 	dockerMetrics := NewDockerMetrics()
@@ -831,7 +847,7 @@ func main() {
 	scraper := NewBackgroundScraper(
 		urlCollectors, dockerCollectors, customCollectors,
 		urlMetrics, dockerMetrics, customReg,
-		metricsReg, mainReg, snap,
+		metricsReg, passMainReg, snap,
 		cfg.Server.MaxConcurrent,
 		scrapeInterval,
 	)

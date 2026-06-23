@@ -5,6 +5,9 @@
 server:
   port: 8080
   metrics_path: /metrics
+  max_concurrent: 10             # 采集最大并发数
+  expose_runtime_metrics: true   # 是否暴露 go_* / process_* 指标（默认 true）
+  metrics_path: /metrics
   max_concurrent: 10    # 采集最大并发数
 
 defaults:

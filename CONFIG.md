@@ -20,6 +20,7 @@ targets:       # 采集目标列表
 | `port` | `8080` | 服务端口 |
 | `metrics_path` | `/metrics` | 指标端点路径 |
 | `max_concurrent` | `10` | URL/Docker/脚本采集最大并发数（防止资源耗尽） |
+| `expose_runtime_metrics` | `true` | 是否暴露 Go runtime / Process 指标（`go_*`、`process_*`） |
 
 ### 新增端点
 
