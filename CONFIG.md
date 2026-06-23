@@ -7,7 +7,7 @@ server:        # 服务配置
 defaults:      # 全局默认值
 targets:       # 采集目标列表
   - name: "xxx"
-    type: xxx  # url | docker | custom
+    type: xxx  # url | docker | custom | remote
     ...
 ```
 
@@ -20,6 +20,7 @@ targets:       # 采集目标列表
 | `port` | `8080` | 服务端口 |
 | `metrics_path` | `/metrics` | 指标端点路径 |
 | `max_concurrent` | `10` | URL/Docker/脚本采集最大并发数（防止资源耗尽） |
+| `expose_runtime_metrics` | `true` | 是否暴露 Go runtime / Process 指标（`go_*`、`process_*`） |
 
 ### 新增端点
 
@@ -47,7 +48,7 @@ targets:       # 采集目标列表
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | `name` | ✅ | 指标名称标识 |
-| `type` | ✅ | `url`、`docker` 或 `custom` |
+| `type` | ✅ | `url`、`docker`、`custom` 或 `remote` |
 | `interval` | ❌ | 覆盖全局采集间隔（预留） |
 | `labels` | ❌ | 附加标签，会写入所有指标 |
 
@@ -209,6 +210,42 @@ skywell_uptime_seconds 86400
 skywell_cpu_percent{env="prod",name="skywell_node",tier="node"} 42.5
 skywell_memory_bytes{env="prod",name="skywell_node",tier="node"} 5.12e+08
 skywell_uptime_seconds{env="prod",name="skywell_node",tier="node"} 86400
+```
+
+---
+
+### 4️⃣ type: remote — 远程 Metrics 代理
+
+直接拉取另一个 Prometheus Exporter 的 `/metrics` 文本，**保留所有原始指标和 Label**。
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `remote.url` | ✅ | 远程 metrics 端点 URL |
+| `remote.headers` | ❌ | 自定义请求头（如认证） |
+
+**特点：**
+- 原始文本解析，完整保留 `HELP`、`TYPE`、`Label` 等信息
+- 指标直接合并到 `/metrics` 输出，与 Prometheus 原生抓取效果一致
+- 支持热加载，修改配置后 `SIGHUP` 即可生效
+
+**示例 — 代理 Node Exporter：**
+
+```yaml
+- name: "remote_node_exporter"
+  type: remote
+  remote:
+    url: "http://localhost:9100/metrics"
+    headers:
+      Authorization: "Bearer your-token"  # 可选
+```
+
+**示例 — 代理 Blackbox Exporter：**
+
+```yaml
+- name: "remote_blackbox"
+  type: remote
+  remote:
+    url: "http://localhost:9115/metrics"
 ```
 
 ---

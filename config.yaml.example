@@ -1,11 +1,12 @@
 #  general-exporter 配置文件
-# 支持的 target 类型: url, docker, custom
+# 支持的 target 类型: url, docker, custom, remote
 # 复制此文件为 config.yaml 并修改后使用
 
 server:
   port: 8080
   metrics_path: /metrics
-  max_concurrent: 10    # 采集最大并发数
+  max_concurrent: 10             # 采集最大并发数
+  expose_runtime_metrics: true   # 是否暴露 go_* / process_* 指标（默认 true）
 
 defaults:
   interval: 30s       # 采集间隔
@@ -78,3 +79,16 @@ targets:
     labels:
       env: "prod"
       tier: "backend"
+
+  # ==================== 远程 Metrics 代理 ====================
+  # - name: "remote_node_exporter"
+  #   type: remote
+  #   remote:
+  #     url: "http://localhost:9100/metrics"
+  #     # headers:         # 可选，自定义请求头
+  #     #   Authorization: "Bearer xxx"
+  #
+  # - name: "remote_blackbox"
+  #   type: remote
+  #   remote:
+  #     url: "http://localhost:9115/metrics"

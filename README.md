@@ -1,12 +1,13 @@
 # general-exporter
 
-轻量级 Prometheus Exporter，用于监控 HTTP 服务、Docker 容器和自定义脚本指标。
+轻量级 Prometheus Exporter，用于监控 HTTP 服务、Docker 容器、远程 Metrics 代理和自定义脚本指标。
 
 ## 特性
 
 - **零依赖部署**：单个二进制文件，无需额外运行时
 - **URL 探测**：HTTP/HTTPS 可用性、状态码、响应内容、延迟、响应大小
 - **Docker 监控**：容器状态、CPU 使用率、内存使用/上限
+- **远程代理**：拉取其他 Exporter 的 /metrics，保留完整 Label 和原始格式
 - **自定义脚本**：执行任意脚本，输出自定义指标（一行一个，`指标名 数值` 格式）
 - **YAML 配置**：声明式配置文件，灵活扩展
 
@@ -112,6 +113,17 @@ echo "skywell_uptime_seconds 86400"
 echo "skywell_connections 15"
 ```
 
+### 远程 Metrics 代理
+
+```yaml
+- name: "remote_node_exporter"
+  type: remote
+  remote:
+    url: "http://localhost:9100/metrics"
+    # headers:         # 可选，自定义请求头
+    #   Authorization: "Bearer xxx"
+```
+
 ## 暴露指标
 
 ### URL 指标
@@ -144,6 +156,11 @@ echo "skywell_connections 15"
 skywell_cpu_percent{env="prod",name="skywell_node",tier="node"} 42.5
 skywell_memory_bytes{env="prod",name="skywell_node",tier="node"} 5.12e+08
 ```
+
+### 远程代理指标
+
+直接透传远程 Exporter 的原始指标文本，保留所有 `HELP`、`TYPE` 注释和 `Label`，
+与 Prometheus 直接抓取该 Exporter 的效果完全一致。
 
 ## 配置项说明
 
