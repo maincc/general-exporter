@@ -11,6 +11,15 @@ server:
 defaults:
   interval: 30s       # 采集间隔
   timeout: 10s        # 单次请求超时
+  # global_labels:    # 可选，全局标签注入所有指标（url/docker/custom，remote 除外）
+  #   cluster: "prod-1"
+  #   region: "cn-shanghai"
+
+# target 级别可关闭全局标签：
+# - name: "internal_api"
+#   type: url
+#   url: "http://internal:8080/health"
+#   use_global_labels: false  # 默认 true，设为 false 则该 target 的全局 label 值为空
 
 targets:
   # ==================== 前端服务 ====================

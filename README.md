@@ -6,9 +6,10 @@
 
 - **零依赖部署**：单个二进制文件，无需额外运行时
 - **URL 探测**：HTTP/HTTPS 可用性、状态码、响应内容、延迟、响应大小
-- **Docker 监控**：容器状态、CPU 使用率、内存使用/上限
+- **Docker 监控**：容器状态、CPU 使用率、内存使用/上限、磁盘容量（可写层 + rootfs）
 - **远程代理**：拉取其他 Exporter 的 /metrics，保留完整 Label 和原始格式
 - **自定义脚本**：执行任意脚本，输出自定义指标（一行一个，`指标名 数值` 格式）
+- **全局标签**：`defaults.global_labels` 自动注入所有指标（url/docker/custom，remote 除外）
 - **YAML 配置**：声明式配置文件，灵活扩展
 
 ## 快速开始
@@ -141,10 +142,12 @@ echo "skywell_connections 15"
 
 | 指标 | 标签 | 说明 |
 |------|------|------|
-| `docker_container_up` | `container, image, env, tier` | 运行中=1，停止=0 |
-| `docker_container_cpu_percent` | `container, image, env, tier` | CPU 使用率 % |
-| `docker_container_memory_usage_bytes` | `container, image, env, tier` | 内存使用（字节） |
-| `docker_container_memory_limit_bytes` | `container, image, env, tier` | 内存上限（字节） |
+| `docker_container_up` | `container, image, env, tier` + global | 运行中=1，停止=0 |
+| `docker_container_cpu_percent` | 同上 | CPU 使用率 % |
+| `docker_container_memory_usage_bytes` | 同上 | 内存使用（字节） |
+| `docker_container_memory_limit_bytes` | 同上 | 内存上限（字节） |
+| `docker_container_disk_rw_bytes` | 同上 | 可写层磁盘大小（字节） |
+| `docker_container_disk_rootfs_bytes` | 同上 | 整个 rootfs 大小（字节） |
 
 ### 自定义脚本指标
 

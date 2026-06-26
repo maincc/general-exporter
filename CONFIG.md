@@ -36,8 +36,26 @@ targets:       # 采集目标列表
 |------|--------|------|
 | `interval` | `30s` | 采集间隔（每个 target 可覆盖） |
 | `timeout` | `10s` | 请求超时 |
+| `global_labels` | 空 | 全局标签，自动注入 url/docker/custom 指标（remote 除外） |
 
-单个 target 可覆盖这些值。
+### global_labels 示例
+
+```yaml
+defaults:
+  interval: 30s
+  timeout: 10s
+  global_labels:
+    cluster: "prod-1"
+    region: "cn-shanghai"
+```
+
+效果：
+```
+url_up{name="frontend", env="prod", tier="frontend", cluster="prod-1", region="cn-shanghai"} 1
+docker_container_up{container="nginx", image="nginx:latest", env="prod", tier="docker", cluster="prod-1", region="cn-shanghai"} 1
+```
+
+Keys 按字母排序，确保 label 顺序一致。
 
 ---
 
@@ -134,10 +152,12 @@ docker_container_up{container="nginx", image="nginx:latest", env="prod", tier="d
 
 | 指标 | 标签 | 说明 |
 |------|------|------|
-| `docker_container_up` | `container, image, env, tier` | 运行中=1，停止=0 |
-| `docker_container_cpu_percent` | `container, image, env, tier` | CPU 使用率 % |
-| `docker_container_memory_usage_bytes` | `container, image, env, tier` | 内存使用（字节） |
-| `docker_container_memory_limit_bytes` | `container, image, env, tier` | 内存上限（字节） |
+| `docker_container_up` | `container, image, env, tier` + global | 运行中=1，停止=0 |
+| `docker_container_cpu_percent` | 同上 | CPU 使用率 % |
+| `docker_container_memory_usage_bytes` | 同上 | 内存使用（字节） |
+| `docker_container_memory_limit_bytes` | 同上 | 内存上限（字节） |
+| `docker_container_disk_rw_bytes` | 同上 | 可写层磁盘大小（字节） |
+| `docker_container_disk_rootfs_bytes` | 同上 | 整个 rootfs 大小（字节） |
 
 **示例 — 所有容器：**
 
