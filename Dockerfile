@@ -7,7 +7,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o general-exporter .
 
 FROM alpine:3.19
-RUN apk add --no-cache docker-cli curl jq
+RUN apk add --no-cache docker-cli curl jq busybox-extras
 WORKDIR /app
 COPY --from=builder /build/general-exporter .
 COPY config.yaml .

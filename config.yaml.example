@@ -68,6 +68,27 @@ targets:
   #   echo "skywell_memory_bytes 512000000"
   #   echo "skywell_connections 15"
 
+  # ==================== SSH 隧道监控 ====================
+  # 每个隧道一个 target，通过 tier/label 区分
+  # 格式: 隧道名:本地端口:远端地址:远端端口 [可选HTTP检查地址]
+  # - name: "ssh_mongodb"
+  #   type: custom
+  #   script: "./scripts/ssh_tunnel_check.sh"
+  #   env:
+  #     SSH_TUNNELS: "mongodb:3307:db.example.com:3306"
+  #   labels:
+  #     env: "prod"
+  #     tier: "mongodb"
+  #
+  # - name: "ssh_redis"
+  #   type: custom
+  #   script: "./scripts/ssh_tunnel_check.sh"
+  #   env:
+  #     SSH_TUNNELS: "redis:6380:127.0.0.1:6379"
+  #   labels:
+  #     env: "prod"
+  #     tier: "redis"
+
   # ==================== 后端服务 ====================
   - name: "backend_api"
     type: url

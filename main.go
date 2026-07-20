@@ -60,6 +60,7 @@ type TargetConfig struct {
 	Names          []string          `yaml:"names"`
 	Interval       string            `yaml:"interval"`
 	Script         string            `yaml:"script"`
+	Env            map[string]string `yaml:"env"`        // env vars passed to script execution
 	Labels         map[string]string `yaml:"labels"`
 	MaxBodySize    int               `yaml:"max_body_size"` // maximum bytes to read from response body (0 = unlimited)
 	Remote         *RemoteTarget     `yaml:"remote"`        // remote metrics endpoint (type=remote)
@@ -631,6 +632,9 @@ func (c *CustomCollector) Collect() {
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", c.cfg.Script)
 	cmd.Env = append(os.Environ(), "TARGET_NAME="+c.cfg.Name)
+	for k, v := range c.cfg.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
