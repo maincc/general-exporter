@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,9 +42,10 @@ type ServerConfig struct {
 }
 
 type DefaultConfig struct {
-	Interval       string `yaml:"interval"`        // HTTP timeout for URL checks
-	Timeout        string `yaml:"timeout"`         // same as Interval, kept for backward compatibility
-	ScrapeInterval string `yaml:"scrape_interval"` // how often to run the background scraper
+	Interval       string            `yaml:"interval"`        // HTTP timeout for URL checks
+	Timeout        string            `yaml:"timeout"`         // same as Interval, kept for backward compatibility
+	ScrapeInterval string            `yaml:"scrape_interval"` // how often to run the background scraper
+	GlobalLabels   map[string]string `yaml:"global_labels"`   // global labels injected into all metrics
 }
 
 type TargetConfig struct {
@@ -58,9 +60,15 @@ type TargetConfig struct {
 	Names          []string          `yaml:"names"`
 	Interval       string            `yaml:"interval"`
 	Script         string            `yaml:"script"`
+	Env            map[string]string `yaml:"env"`        // env vars passed to script execution
 	Labels         map[string]string `yaml:"labels"`
 	MaxBodySize    int               `yaml:"max_body_size"` // maximum bytes to read from response body (0 = unlimited)
 	Remote         *RemoteTarget     `yaml:"remote"`        // remote metrics endpoint (type=remote)
+	URI            string            `yaml:"uri"`           // mongodb connection string (type=mongodb)
+	Database       string            `yaml:"database"`      // mongodb database name (type=mongodb)
+	Collection     string            `yaml:"collection"`    // mongodb collection name (type=mongodb)
+	Query          map[string]any    `yaml:"query"`         // mongodb filter; empty = latest document (type=mongodb)
+	Metrics        []MongoMetric     `yaml:"metrics"`       // mongodb fields to export (type=mongodb)
 }
 
 type RemoteTarget struct {
@@ -128,6 +136,16 @@ func validateConfig(cfg *Config) error {
 			if t.Remote == nil || t.Remote.URL == "" {
 				return fmt.Errorf("target %s: missing 'remote.url'", t.Name)
 			}
+		case "mongodb":
+			if t.URI == "" {
+				return fmt.Errorf("target %s: missing 'uri'", t.Name)
+			}
+			if t.Database == "" || t.Collection == "" {
+				return fmt.Errorf("target %s: missing 'database' or 'collection'", t.Name)
+			}
+			if len(t.Metrics) == 0 {
+				return fmt.Errorf("target %s: missing 'metrics'", t.Name)
+			}
 		default:
 			return fmt.Errorf("target %s: unknown type %q", t.Name, t.Type)
 		}
@@ -146,6 +164,20 @@ func parseDuration(s string, fallback string) time.Duration {
 	return d
 }
 
+// extractGlobalLabels returns sorted keys and values map from global labels.
+func extractGlobalLabels(labels map[string]string) ([]string, map[string]string) {
+	if len(labels) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, labels
+}
+
+
 // ==================== Shared Metrics ====================
 
 type URLMetrics struct {
@@ -157,27 +189,28 @@ type URLMetrics struct {
 	responseSize *prometheus.GaugeVec
 }
 
-func NewURLMetrics() *URLMetrics {
-	extraLabels := []string{"env", "tier"}
+func NewURLMetrics(globalKeys []string) *URLMetrics {
+	baseLabels := []string{"name", "env", "tier"}
+	allLabels := append(baseLabels, globalKeys...)
 	return &URLMetrics{
 		up: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "url_up", Help: "URL probe success (1=yes, 0=no)",
-		}, append([]string{"name"}, extraLabels...)),
+		}, allLabels),
 		statusCode: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "url_http_status", Help: "HTTP response status code",
-		}, append([]string{"name"}, extraLabels...)),
+		}, allLabels),
 		duration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "url_duration_seconds", Help: "HTTP probe duration",
-		}, append([]string{"name"}, extraLabels...)),
+		}, allLabels),
 		bodyMatch: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "url_body_match", Help: "Expected body content found (1=yes, 0=no)",
-		}, append([]string{"name"}, extraLabels...)),
+		}, allLabels),
 		statusMatch: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "url_status_match", Help: "Expected status code matched (1=yes, 0=no)",
-		}, append([]string{"name"}, extraLabels...)),
+		}, allLabels),
 		responseSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "url_response_size_bytes", Help: "Response body size",
-		}, append([]string{"name"}, extraLabels...)),
+		}, allLabels),
 	}
 }
 
@@ -186,40 +219,53 @@ type DockerMetrics struct {
 	cpuPercent *prometheus.GaugeVec
 	memUsage   *prometheus.GaugeVec
 	memLimit   *prometheus.GaugeVec
+	diskRw     *prometheus.GaugeVec
+	diskRootFs *prometheus.GaugeVec
 }
 
-func NewDockerMetrics() *DockerMetrics {
-	extraLabels := []string{"env", "tier"}
+func NewDockerMetrics(globalKeys []string) *DockerMetrics {
+	baseLabels := []string{"container", "image", "env", "tier"}
+	allLabels := append(baseLabels, globalKeys...)
 	return &DockerMetrics{
 		up: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "docker_container_up", Help: "Container is running (1=yes, 0=no)",
-		}, append([]string{"container", "image"}, extraLabels...)),
+		}, allLabels),
 		cpuPercent: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "docker_container_cpu_percent", Help: "Container CPU usage percent",
-		}, append([]string{"container", "image"}, extraLabels...)),
+		}, allLabels),
 		memUsage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "docker_container_memory_usage_bytes", Help: "Container memory usage",
-		}, append([]string{"container", "image"}, extraLabels...)),
+		}, allLabels),
 		memLimit: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "docker_container_memory_limit_bytes", Help: "Container memory limit",
-		}, append([]string{"container", "image"}, extraLabels...)),
+		}, allLabels),
+		diskRw: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "docker_container_disk_rw_bytes", Help: "Container writable layer size",
+		}, allLabels),
+		diskRootFs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "docker_container_disk_rootfs_bytes", Help: "Container root filesystem total size",
+		}, allLabels),
 	}
 }
 
 // ==================== Custom Metric Registry (global) ====================
 
 type CustomMetricRegistry struct {
-	mu         sync.Mutex
-	gauges     map[string]*prometheus.GaugeVec
-	reg        *prometheus.Registry
-	seenNames  map[string]bool // track metric names seen in current round
+	mu           sync.Mutex
+	gauges       map[string]*prometheus.GaugeVec
+	reg          *prometheus.Registry
+	seenNames    map[string]bool     // track metric names seen in current round
+	globalKeys   []string
+	globalValues map[string]string
 }
 
-func NewCustomMetricRegistry(reg *prometheus.Registry) *CustomMetricRegistry {
+func NewCustomMetricRegistry(reg *prometheus.Registry, globalKeys []string, globalValues map[string]string) *CustomMetricRegistry {
 	return &CustomMetricRegistry{
-		gauges:    make(map[string]*prometheus.GaugeVec),
-		reg:       reg,
-		seenNames: make(map[string]bool),
+		gauges:       make(map[string]*prometheus.GaugeVec),
+		reg:          reg,
+		seenNames:    make(map[string]bool),
+		globalKeys:   globalKeys,
+		globalValues: globalValues,
 	}
 }
 
@@ -232,7 +278,7 @@ func (r *CustomMetricRegistry) GetOrCreateGauge(name string) *prometheus.GaugeVe
 		r.seenNames[name] = true
 		return g
 	}
-	labels := []string{"name", "env", "tier"}
+	labels := append([]string{"name", "env", "tier"}, r.globalKeys...)
 	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: name,
 		Help: "Custom metric from script",
@@ -268,13 +314,14 @@ func (r *CustomMetricRegistry) PurgeStale() {
 // ==================== URL Collector ====================
 
 type URLCollector struct {
-	cfg      TargetConfig
-	defaults DefaultConfig
-	metrics  *URLMetrics
+	cfg          TargetConfig
+	defaults     DefaultConfig
+	metrics      *URLMetrics
+	globalValues map[string]string
 }
 
-func NewURLCollector(cfg TargetConfig, defaults DefaultConfig, m *URLMetrics) *URLCollector {
-	return &URLCollector{cfg: cfg, defaults: defaults, metrics: m}
+func NewURLCollector(cfg TargetConfig, defaults DefaultConfig, m *URLMetrics, globalValues map[string]string) *URLCollector {
+	return &URLCollector{cfg: cfg, defaults: defaults, metrics: m, globalValues: globalValues}
 }
 
 func (c *URLCollector) Collect() {
@@ -283,6 +330,9 @@ func (c *URLCollector) Collect() {
 		"name": c.cfg.Name,
 		"env":  c.cfg.Labels["env"],
 		"tier": c.cfg.Labels["tier"],
+	}
+	for k, v := range c.globalValues {
+		lv[k] = v
 	}
 
 	method := c.cfg.Method
@@ -359,10 +409,12 @@ func (c *URLCollector) Collect() {
 // ==================== Docker Collector ====================
 
 type DockerContainer struct {
-	ID    string      `json:"Id"`
-	Name  string      `json:"Name"`
-	State DockerState `json:"State"`
-	Image string      `json:"Image"`
+	ID         string      `json:"Id"`
+	Name       string      `json:"Name"`
+	State      DockerState `json:"State"`
+	Image      string      `json:"Image"`
+	SizeRw     int64       `json:"SizeRw"`
+	SizeRootFs int64       `json:"SizeRootFs"`
 }
 
 type DockerState struct {
@@ -370,12 +422,14 @@ type DockerState struct {
 }
 
 type DockerCollector struct {
-	cfg     TargetConfig
-	metrics *DockerMetrics
+	cfg          TargetConfig
+	metrics      *DockerMetrics
+	globalKeys   []string
+	globalValues map[string]string
 }
 
-func NewDockerCollector(cfg TargetConfig, m *DockerMetrics) *DockerCollector {
-	return &DockerCollector{cfg: cfg, metrics: m}
+func NewDockerCollector(cfg TargetConfig, m *DockerMetrics, globalKeys []string, globalValues map[string]string) *DockerCollector {
+	return &DockerCollector{cfg: cfg, metrics: m, globalKeys: globalKeys, globalValues: globalValues}
 }
 
 func (c *DockerCollector) Collect() {
@@ -395,7 +449,12 @@ func (c *DockerCollector) Collect() {
 		}
 
 		lv := []string{name, image, c.cfg.Labels["env"], c.cfg.Labels["tier"]}
+		for _, k := range c.globalKeys {
+			lv = append(lv, c.globalValues[k])
+		}
 		c.metrics.up.WithLabelValues(lv...).Set(float64(isRunning))
+		c.metrics.diskRw.WithLabelValues(lv...).Set(float64(ct.SizeRw))
+		c.metrics.diskRootFs.WithLabelValues(lv...).Set(float64(ct.SizeRootFs))
 
 		if state == "running" {
 			stats, err := c.getContainerStats(ct.ID)
@@ -432,8 +491,8 @@ func (c *DockerCollector) listContainers() ([]DockerContainer, error) {
 		return nil, nil
 	}
 
-	// Batch inspect
-	args := append([]string{"inspect", "--format", "{{json .}}"}, containerNames...)
+	// Batch inspect with size
+	args := append([]string{"inspect", "--size", "--format", "{{json .}}"}, containerNames...)
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.Output()
 	if err != nil {
@@ -458,7 +517,7 @@ func (c *DockerCollector) listContainers() ([]DockerContainer, error) {
 func (c *DockerCollector) inspectOneByOne(names []string) ([]DockerContainer, error) {
 	var containers []DockerContainer
 	for _, name := range names {
-		cmd := exec.Command("docker", "inspect", "--format", "{{json .}}", name)
+		cmd := exec.Command("docker", "inspect", "--size", "--format", "{{json .}}", name)
 		out, err := cmd.Output()
 		if err != nil {
 			log.Printf("[docker:%s] inspect %s: %v", c.cfg.Name, name, err)
@@ -559,14 +618,15 @@ func parseBytes(s string) float64 {
 // ==================== Custom (Script) Collector ====================
 
 type CustomCollector struct {
-	cfg      TargetConfig
-	defaults DefaultConfig
-	reg      *CustomMetricRegistry // global registry
+	cfg          TargetConfig
+	defaults     DefaultConfig
+	reg          *CustomMetricRegistry // global registry
+	globalValues map[string]string
 }
 
-func NewCustomCollector(cfg TargetConfig, defaults DefaultConfig, reg *CustomMetricRegistry) *CustomCollector {
+func NewCustomCollector(cfg TargetConfig, defaults DefaultConfig, reg *CustomMetricRegistry, globalValues map[string]string) *CustomCollector {
 	return &CustomCollector{
-		cfg: cfg, defaults: defaults, reg: reg,
+		cfg: cfg, defaults: defaults, reg: reg, globalValues: globalValues,
 	}
 }
 
@@ -576,6 +636,9 @@ func (c *CustomCollector) Collect() {
 		"env":  c.cfg.Labels["env"],
 		"tier": c.cfg.Labels["tier"],
 	}
+	for k, v := range c.globalValues {
+		lv[k] = v
+	}
 
 	// Use context with timeout to prevent hung scripts
 	timeout := parseDuration(c.defaults.Timeout, "30s")
@@ -584,6 +647,9 @@ func (c *CustomCollector) Collect() {
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", c.cfg.Script)
 	cmd.Env = append(os.Environ(), "TARGET_NAME="+c.cfg.Name)
+	for k, v := range c.cfg.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -718,10 +784,12 @@ type BackgroundScraper struct {
 	dockerCollectors []*DockerCollector
 	customCollectors []*CustomCollector
 	remoteCollectors []*RemoteCollector
+	mongoCollectors  []*MongoCollector
 	remotePrevNames  map[string]bool
 	urlMetrics       *URLMetrics
 	dockerMetrics    *DockerMetrics
 	customReg        *CustomMetricRegistry
+	mongoReg         *MongoMetricRegistry
 	metricsReg       *prometheus.Registry
 	mainReg          *prometheus.Registry
 	snap             *snapshotGatherer
@@ -735,9 +803,11 @@ func NewBackgroundScraper(
 	dockerCollectors []*DockerCollector,
 	customCollectors []*CustomCollector,
 	remoteCollectors []*RemoteCollector,
+	mongoCollectors []*MongoCollector,
 	urlMetrics *URLMetrics,
 	dockerMetrics *DockerMetrics,
 	customReg *CustomMetricRegistry,
+	mongoReg *MongoMetricRegistry,
 	metricsReg *prometheus.Registry,
 	mainReg *prometheus.Registry,
 	snap *snapshotGatherer,
@@ -752,10 +822,12 @@ func NewBackgroundScraper(
 		dockerCollectors: dockerCollectors,
 		customCollectors: customCollectors,
 		remoteCollectors: remoteCollectors,
+		mongoCollectors:  mongoCollectors,
 		remotePrevNames:  make(map[string]bool),
 		urlMetrics:       urlMetrics,
 		dockerMetrics:    dockerMetrics,
 		customReg:        customReg,
+		mongoReg:         mongoReg,
 		metricsReg:       metricsReg,
 		mainReg:          mainReg,
 		snap:             snap,
@@ -771,15 +843,21 @@ func (s *BackgroundScraper) Update(
 	dockerCollectors []*DockerCollector,
 	customCollectors []*CustomCollector,
 	remoteCollectors []*RemoteCollector,
+	mongoCollectors []*MongoCollector,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Close old mongo clients to release connection pools
+	for _, mc := range s.mongoCollectors {
+		mc.Close()
+	}
 	s.urlCollectors = urlCollectors
 	s.dockerCollectors = dockerCollectors
 	s.customCollectors = customCollectors
 	s.remoteCollectors = remoteCollectors
-	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d, remote=%d",
-		len(urlCollectors), len(dockerCollectors), len(customCollectors), len(remoteCollectors))
+	s.mongoCollectors = mongoCollectors
+	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d, remote=%d, mongo=%d",
+		len(urlCollectors), len(dockerCollectors), len(customCollectors), len(remoteCollectors), len(mongoCollectors))
 }
 
 func (s *BackgroundScraper) scrapeOnce() {
@@ -794,7 +872,10 @@ func (s *BackgroundScraper) scrapeOnce() {
 	s.dockerMetrics.cpuPercent.Reset()
 	s.dockerMetrics.memUsage.Reset()
 	s.dockerMetrics.memLimit.Reset()
+	s.dockerMetrics.diskRw.Reset()
+	s.dockerMetrics.diskRootFs.Reset()
 	s.customReg.ResetAll() // reset all custom metrics
+	s.mongoReg.ResetAll()  // reset all mongo metrics
 
 	// Snapshot current collector lists
 	s.mu.RLock()
@@ -802,6 +883,7 @@ func (s *BackgroundScraper) scrapeOnce() {
 	dockers := s.dockerCollectors
 	customs := s.customCollectors
 	remotes := s.remoteCollectors
+	mongos := s.mongoCollectors
 	s.mu.RUnlock()
 
 	var wg sync.WaitGroup
@@ -835,6 +917,16 @@ func (s *BackgroundScraper) scrapeOnce() {
 			c.Collect()
 			<-sem
 		}(cc)
+	}
+
+	for _, mc := range mongos {
+		wg.Add(1)
+		go func(c *MongoCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			c.Collect()
+			<-sem
+		}(mc)
 	}
 
 	// Remote collectors: fetch raw metrics text and parse into MetricFamilies
@@ -913,31 +1005,38 @@ func buildCollectors(
 	urlMetrics *URLMetrics,
 	dockerMetrics *DockerMetrics,
 	customReg *CustomMetricRegistry,
-) ([]*URLCollector, []*DockerCollector, []*CustomCollector, []*RemoteCollector) {
+	mongoReg *MongoMetricRegistry,
+	globalKeys []string,
+	globalValues map[string]string,
+) ([]*URLCollector, []*DockerCollector, []*CustomCollector, []*RemoteCollector, []*MongoCollector) {
 	var urlCollectors []*URLCollector
 	var dockerCollectors []*DockerCollector
 	var customCollectors []*CustomCollector
 	var remoteCollectors []*RemoteCollector
+	var mongoCollectors []*MongoCollector
 
 	for _, t := range cfg.Targets {
 		switch t.Type {
 		case "url":
 			log.Printf("Registering URL collector: %s -> %s", t.Name, t.URL)
-			urlCollectors = append(urlCollectors, NewURLCollector(t, cfg.Defaults, urlMetrics))
+			urlCollectors = append(urlCollectors, NewURLCollector(t, cfg.Defaults, urlMetrics, globalValues))
 		case "docker":
 			log.Printf("Registering Docker collector: %s (mode=%s)", t.Name, t.Mode)
-			dockerCollectors = append(dockerCollectors, NewDockerCollector(t, dockerMetrics))
+			dockerCollectors = append(dockerCollectors, NewDockerCollector(t, dockerMetrics, globalKeys, globalValues))
 		case "custom":
 			log.Printf("Registering Custom collector: %s (script=%s)", t.Name, t.Script)
-			customCollectors = append(customCollectors, NewCustomCollector(t, cfg.Defaults, customReg))
+			customCollectors = append(customCollectors, NewCustomCollector(t, cfg.Defaults, customReg, globalValues))
 		case "remote":
 			log.Printf("Registering Remote collector: %s -> %s", t.Name, t.Remote.URL)
 			remoteCollectors = append(remoteCollectors, NewRemoteCollector(t, cfg.Defaults))
+		case "mongodb":
+			log.Printf("Registering Mongo collector: %s -> %s.%s", t.Name, t.Database, t.Collection)
+			mongoCollectors = append(mongoCollectors, NewMongoCollector(t, cfg.Defaults, mongoReg, globalValues))
 		default:
 			log.Printf("WARNING: unknown target type %q, skipping %s", t.Type, t.Name)
 		}
 	}
-	return urlCollectors, dockerCollectors, customCollectors, remoteCollectors
+	return urlCollectors, dockerCollectors, customCollectors, remoteCollectors, mongoCollectors
 }
 
 func main() {
@@ -974,26 +1073,32 @@ func main() {
 		passMainReg = nil
 	}
 
-	urlMetrics := NewURLMetrics()
-	dockerMetrics := NewDockerMetrics()
-	customReg := NewCustomMetricRegistry(metricsReg)
+	globalKeys, globalValues := extractGlobalLabels(cfg.Defaults.GlobalLabels)
+	log.Printf("[config] global labels: %v", globalValues)
+
+	urlMetrics := NewURLMetrics(globalKeys)
+	dockerMetrics := NewDockerMetrics(globalKeys)
+	customReg := NewCustomMetricRegistry(metricsReg, globalKeys, globalValues)
+	mongoReg := NewMongoMetricRegistry(metricsReg, globalKeys, globalValues)
 
 	metricsReg.MustRegister(urlMetrics.up, urlMetrics.statusCode, urlMetrics.duration,
 		urlMetrics.bodyMatch, urlMetrics.statusMatch, urlMetrics.responseSize)
 	metricsReg.MustRegister(dockerMetrics.up, dockerMetrics.cpuPercent,
-		dockerMetrics.memUsage, dockerMetrics.memLimit)
+		dockerMetrics.memUsage, dockerMetrics.memLimit,
+		dockerMetrics.diskRw, dockerMetrics.diskRootFs)
 	// Custom metrics are registered dynamically via customReg
+	// Mongo metrics are registered dynamically via mongoReg
 
 	// Initial build of collectors
-	urlCollectors, dockerCollectors, customCollectors, remoteCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg)
+	urlCollectors, dockerCollectors, customCollectors, remoteCollectors, mongoCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg, mongoReg, globalKeys, globalValues)
 
 	// Snapshot gatherer
 	snap := &snapshotGatherer{}
 
 	scrapeInterval := parseDuration(cfg.Defaults.ScrapeInterval, "5s")
 	scraper := NewBackgroundScraper(
-		urlCollectors, dockerCollectors, customCollectors, remoteCollectors,
-		urlMetrics, dockerMetrics, customReg,
+		urlCollectors, dockerCollectors, customCollectors, remoteCollectors, mongoCollectors,
+		urlMetrics, dockerMetrics, customReg, mongoReg,
 		metricsReg, passMainReg, snap,
 		cfg.Server.MaxConcurrent,
 		scrapeInterval,
@@ -1034,9 +1139,10 @@ func main() {
 					continue
 				}
 				// Rebuild collectors with new config
-				newURL, newDocker, newCustom, newRemote := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg)
+				newGlobalKeys, newGlobalValues := extractGlobalLabels(newCfg.Defaults.GlobalLabels)
+				newURL, newDocker, newCustom, newRemote, newMongo := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg, mongoReg, newGlobalKeys, newGlobalValues)
 				// Atomically update the scraper
-				scraper.Update(newURL, newDocker, newCustom, newRemote)
+				scraper.Update(newURL, newDocker, newCustom, newRemote, newMongo)
 				cfg = newCfg // update global config for /config endpoint
 				log.Printf("[config] reloaded: %d targets", len(cfg.Targets))
 

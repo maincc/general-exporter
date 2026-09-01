@@ -7,8 +7,9 @@ services:
       args:
         EXPORTER_PORT: ${EXPORTER_PORT:-8081}
     container_name: general-exporter
-    ports:
-      - "${EXPORTER_PORT:-8081}:${EXPORTER_PORT:-8081}"
+    network_mode: host
+    # ports:
+    #   - "${EXPORTER_PORT:-8081}:${EXPORTER_PORT:-8081}"
     environment:
       - EXPORTER_PORT=${EXPORTER_PORT:-8081}
     volumes:

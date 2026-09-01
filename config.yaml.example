@@ -1,5 +1,5 @@
 #  general-exporter 配置文件
-# 支持的 target 类型: url, docker, custom, remote
+# 支持的 target 类型: url, docker, custom, remote, mongodb
 # 复制此文件为 config.yaml 并修改后使用
 
 server:
@@ -11,6 +11,15 @@ server:
 defaults:
   interval: 30s       # 采集间隔
   timeout: 10s        # 单次请求超时
+  # global_labels:    # 可选，全局标签注入所有指标（url/docker/custom，remote 除外）
+  #   cluster: "prod-1"
+  #   region: "cn-shanghai"
+
+# target 级别可关闭全局标签：
+# - name: "internal_api"
+#   type: url
+#   url: "http://internal:8080/health"
+#   use_global_labels: false  # 默认 true，设为 false 则该 target 的全局 label 值为空
 
 targets:
   # ==================== 前端服务 ====================
@@ -59,6 +68,27 @@ targets:
   #   echo "skywell_memory_bytes 512000000"
   #   echo "skywell_connections 15"
 
+  # ==================== SSH 隧道监控 ====================
+  # 每个隧道一个 target，通过 tier/label 区分
+  # 格式: 隧道名:本地端口:远端地址:远端端口 [可选HTTP检查地址]
+  # - name: "ssh_mongodb"
+  #   type: custom
+  #   script: "./scripts/ssh_tunnel_check.sh"
+  #   env:
+  #     SSH_TUNNELS: "mongodb:3307:db.example.com:3306"
+  #   labels:
+  #     env: "prod"
+  #     tier: "mongodb"
+  #
+  # - name: "ssh_redis"
+  #   type: custom
+  #   script: "./scripts/ssh_tunnel_check.sh"
+  #   env:
+  #     SSH_TUNNELS: "redis:6380:127.0.0.1:6379"
+  #   labels:
+  #     env: "prod"
+  #     tier: "redis"
+
   # ==================== 后端服务 ====================
   - name: "backend_api"
     type: url
@@ -92,3 +122,34 @@ targets:
   #   type: remote
   #   remote:
   #     url: "http://localhost:9115/metrics"
+
+  # ==================== MongoDB 进度表心跳监控 ====================
+  # 适用：扫描器 / 定时任务等"自己写进度表"的服务。
+  # 只读查询最新进度文档，输出存活 + 进度指标；query 为空=取集合最新文档。
+  # 失败语义：只发 mongodb_probe_up=0，不发数值指标（防旧值误判）。
+  # 注意：集合若存在新旧多条记录，必须配 query 按 processName 过滤。
+  #
+  # - name: "swtc_balance"
+  #   type: mongodb
+  #   uri: "mongodb://192.168.66.254:27018/?directConnection=true"
+  #   database: "skywell_profit"
+  #   collection: "blockno"
+  #   query: { processName: "scan_balance" }
+  #   metrics:
+  #     - { name: "swtc_scan_last_update", field: "updateAt" }  # 毫秒时间戳
+  #     - { name: "swtc_scan_end", field: "end" }               # 已扫区块高度
+  #   labels:
+  #     env: "prod"
+  #     tier: "blockchain"
+  #
+  # - name: "swtc_cron_cross_chain"
+  #   type: mongodb
+  #   uri: "mongodb://192.168.66.254:27018/?directConnection=true"
+  #   database: "skywell_sum"
+  #   collection: "process_status"
+  #   query: { processName: "scan_cross_chain_rank_v2" }
+  #   metrics:
+  #     - { name: "swtc_cron_last_update", field: "updateAt" }
+  #   labels:
+  #     env: "prod"
+  #     tier: "blockchain"
