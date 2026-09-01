@@ -64,6 +64,11 @@ type TargetConfig struct {
 	Labels         map[string]string `yaml:"labels"`
 	MaxBodySize    int               `yaml:"max_body_size"` // maximum bytes to read from response body (0 = unlimited)
 	Remote         *RemoteTarget     `yaml:"remote"`        // remote metrics endpoint (type=remote)
+	URI            string            `yaml:"uri"`           // mongodb connection string (type=mongodb)
+	Database       string            `yaml:"database"`      // mongodb database name (type=mongodb)
+	Collection     string            `yaml:"collection"`    // mongodb collection name (type=mongodb)
+	Query          map[string]any    `yaml:"query"`         // mongodb filter; empty = latest document (type=mongodb)
+	Metrics        []MongoMetric     `yaml:"metrics"`       // mongodb fields to export (type=mongodb)
 }
 
 type RemoteTarget struct {
@@ -130,6 +135,16 @@ func validateConfig(cfg *Config) error {
 		case "remote":
 			if t.Remote == nil || t.Remote.URL == "" {
 				return fmt.Errorf("target %s: missing 'remote.url'", t.Name)
+			}
+		case "mongodb":
+			if t.URI == "" {
+				return fmt.Errorf("target %s: missing 'uri'", t.Name)
+			}
+			if t.Database == "" || t.Collection == "" {
+				return fmt.Errorf("target %s: missing 'database' or 'collection'", t.Name)
+			}
+			if len(t.Metrics) == 0 {
+				return fmt.Errorf("target %s: missing 'metrics'", t.Name)
 			}
 		default:
 			return fmt.Errorf("target %s: unknown type %q", t.Name, t.Type)
@@ -769,10 +784,12 @@ type BackgroundScraper struct {
 	dockerCollectors []*DockerCollector
 	customCollectors []*CustomCollector
 	remoteCollectors []*RemoteCollector
+	mongoCollectors  []*MongoCollector
 	remotePrevNames  map[string]bool
 	urlMetrics       *URLMetrics
 	dockerMetrics    *DockerMetrics
 	customReg        *CustomMetricRegistry
+	mongoReg         *MongoMetricRegistry
 	metricsReg       *prometheus.Registry
 	mainReg          *prometheus.Registry
 	snap             *snapshotGatherer
@@ -786,9 +803,11 @@ func NewBackgroundScraper(
 	dockerCollectors []*DockerCollector,
 	customCollectors []*CustomCollector,
 	remoteCollectors []*RemoteCollector,
+	mongoCollectors []*MongoCollector,
 	urlMetrics *URLMetrics,
 	dockerMetrics *DockerMetrics,
 	customReg *CustomMetricRegistry,
+	mongoReg *MongoMetricRegistry,
 	metricsReg *prometheus.Registry,
 	mainReg *prometheus.Registry,
 	snap *snapshotGatherer,
@@ -803,10 +822,12 @@ func NewBackgroundScraper(
 		dockerCollectors: dockerCollectors,
 		customCollectors: customCollectors,
 		remoteCollectors: remoteCollectors,
+		mongoCollectors:  mongoCollectors,
 		remotePrevNames:  make(map[string]bool),
 		urlMetrics:       urlMetrics,
 		dockerMetrics:    dockerMetrics,
 		customReg:        customReg,
+		mongoReg:         mongoReg,
 		metricsReg:       metricsReg,
 		mainReg:          mainReg,
 		snap:             snap,
@@ -822,15 +843,21 @@ func (s *BackgroundScraper) Update(
 	dockerCollectors []*DockerCollector,
 	customCollectors []*CustomCollector,
 	remoteCollectors []*RemoteCollector,
+	mongoCollectors []*MongoCollector,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Close old mongo clients to release connection pools
+	for _, mc := range s.mongoCollectors {
+		mc.Close()
+	}
 	s.urlCollectors = urlCollectors
 	s.dockerCollectors = dockerCollectors
 	s.customCollectors = customCollectors
 	s.remoteCollectors = remoteCollectors
-	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d, remote=%d",
-		len(urlCollectors), len(dockerCollectors), len(customCollectors), len(remoteCollectors))
+	s.mongoCollectors = mongoCollectors
+	log.Printf("[scraper] collectors updated: url=%d, docker=%d, custom=%d, remote=%d, mongo=%d",
+		len(urlCollectors), len(dockerCollectors), len(customCollectors), len(remoteCollectors), len(mongoCollectors))
 }
 
 func (s *BackgroundScraper) scrapeOnce() {
@@ -848,6 +875,7 @@ func (s *BackgroundScraper) scrapeOnce() {
 	s.dockerMetrics.diskRw.Reset()
 	s.dockerMetrics.diskRootFs.Reset()
 	s.customReg.ResetAll() // reset all custom metrics
+	s.mongoReg.ResetAll()  // reset all mongo metrics
 
 	// Snapshot current collector lists
 	s.mu.RLock()
@@ -855,6 +883,7 @@ func (s *BackgroundScraper) scrapeOnce() {
 	dockers := s.dockerCollectors
 	customs := s.customCollectors
 	remotes := s.remoteCollectors
+	mongos := s.mongoCollectors
 	s.mu.RUnlock()
 
 	var wg sync.WaitGroup
@@ -888,6 +917,16 @@ func (s *BackgroundScraper) scrapeOnce() {
 			c.Collect()
 			<-sem
 		}(cc)
+	}
+
+	for _, mc := range mongos {
+		wg.Add(1)
+		go func(c *MongoCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			c.Collect()
+			<-sem
+		}(mc)
 	}
 
 	// Remote collectors: fetch raw metrics text and parse into MetricFamilies
@@ -966,13 +1005,15 @@ func buildCollectors(
 	urlMetrics *URLMetrics,
 	dockerMetrics *DockerMetrics,
 	customReg *CustomMetricRegistry,
+	mongoReg *MongoMetricRegistry,
 	globalKeys []string,
 	globalValues map[string]string,
-) ([]*URLCollector, []*DockerCollector, []*CustomCollector, []*RemoteCollector) {
+) ([]*URLCollector, []*DockerCollector, []*CustomCollector, []*RemoteCollector, []*MongoCollector) {
 	var urlCollectors []*URLCollector
 	var dockerCollectors []*DockerCollector
 	var customCollectors []*CustomCollector
 	var remoteCollectors []*RemoteCollector
+	var mongoCollectors []*MongoCollector
 
 	for _, t := range cfg.Targets {
 		switch t.Type {
@@ -988,11 +1029,14 @@ func buildCollectors(
 		case "remote":
 			log.Printf("Registering Remote collector: %s -> %s", t.Name, t.Remote.URL)
 			remoteCollectors = append(remoteCollectors, NewRemoteCollector(t, cfg.Defaults))
+		case "mongodb":
+			log.Printf("Registering Mongo collector: %s -> %s.%s", t.Name, t.Database, t.Collection)
+			mongoCollectors = append(mongoCollectors, NewMongoCollector(t, cfg.Defaults, mongoReg, globalValues))
 		default:
 			log.Printf("WARNING: unknown target type %q, skipping %s", t.Type, t.Name)
 		}
 	}
-	return urlCollectors, dockerCollectors, customCollectors, remoteCollectors
+	return urlCollectors, dockerCollectors, customCollectors, remoteCollectors, mongoCollectors
 }
 
 func main() {
@@ -1035,6 +1079,7 @@ func main() {
 	urlMetrics := NewURLMetrics(globalKeys)
 	dockerMetrics := NewDockerMetrics(globalKeys)
 	customReg := NewCustomMetricRegistry(metricsReg, globalKeys, globalValues)
+	mongoReg := NewMongoMetricRegistry(metricsReg, globalKeys, globalValues)
 
 	metricsReg.MustRegister(urlMetrics.up, urlMetrics.statusCode, urlMetrics.duration,
 		urlMetrics.bodyMatch, urlMetrics.statusMatch, urlMetrics.responseSize)
@@ -1042,17 +1087,18 @@ func main() {
 		dockerMetrics.memUsage, dockerMetrics.memLimit,
 		dockerMetrics.diskRw, dockerMetrics.diskRootFs)
 	// Custom metrics are registered dynamically via customReg
+	// Mongo metrics are registered dynamically via mongoReg
 
 	// Initial build of collectors
-	urlCollectors, dockerCollectors, customCollectors, remoteCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg, globalKeys, globalValues)
+	urlCollectors, dockerCollectors, customCollectors, remoteCollectors, mongoCollectors := buildCollectors(cfg, urlMetrics, dockerMetrics, customReg, mongoReg, globalKeys, globalValues)
 
 	// Snapshot gatherer
 	snap := &snapshotGatherer{}
 
 	scrapeInterval := parseDuration(cfg.Defaults.ScrapeInterval, "5s")
 	scraper := NewBackgroundScraper(
-		urlCollectors, dockerCollectors, customCollectors, remoteCollectors,
-		urlMetrics, dockerMetrics, customReg,
+		urlCollectors, dockerCollectors, customCollectors, remoteCollectors, mongoCollectors,
+		urlMetrics, dockerMetrics, customReg, mongoReg,
 		metricsReg, passMainReg, snap,
 		cfg.Server.MaxConcurrent,
 		scrapeInterval,
@@ -1094,9 +1140,9 @@ func main() {
 				}
 				// Rebuild collectors with new config
 				newGlobalKeys, newGlobalValues := extractGlobalLabels(newCfg.Defaults.GlobalLabels)
-				newURL, newDocker, newCustom, newRemote := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg, newGlobalKeys, newGlobalValues)
+				newURL, newDocker, newCustom, newRemote, newMongo := buildCollectors(newCfg, urlMetrics, dockerMetrics, customReg, mongoReg, newGlobalKeys, newGlobalValues)
 				// Atomically update the scraper
-				scraper.Update(newURL, newDocker, newCustom, newRemote)
+				scraper.Update(newURL, newDocker, newCustom, newRemote, newMongo)
 				cfg = newCfg // update global config for /config endpoint
 				log.Printf("[config] reloaded: %d targets", len(cfg.Targets))
 

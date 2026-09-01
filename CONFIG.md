@@ -7,7 +7,7 @@ server:        # 服务配置
 defaults:      # 全局默认值
 targets:       # 采集目标列表
   - name: "xxx"
-    type: xxx  # url | docker | custom | remote
+    type: xxx  # url | docker | custom | remote | mongodb
     ...
 ```
 
@@ -36,7 +36,7 @@ targets:       # 采集目标列表
 |------|--------|------|
 | `interval` | `30s` | 采集间隔（每个 target 可覆盖） |
 | `timeout` | `10s` | 请求超时 |
-| `global_labels` | 空 | 全局标签，自动注入 url/docker/custom 指标（remote 除外） |
+| `global_labels` | 空 | 全局标签，自动注入 url/docker/custom/mongodb 指标（remote 除外） |
 
 ### global_labels 示例
 
@@ -66,7 +66,7 @@ Keys 按字母排序，确保 label 顺序一致。
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | `name` | ✅ | 指标名称标识 |
-| `type` | ✅ | `url`、`docker`、`custom` 或 `remote` |
+| `type` | ✅ | `url`、`docker`、`custom`、`remote` 或 `mongodb` |
 | `interval` | ❌ | 覆盖全局采集间隔（预留） |
 | `labels` | ❌ | 附加标签，会写入所有指标 |
 
@@ -267,6 +267,95 @@ skywell_uptime_seconds{env="prod",name="skywell_node",tier="node"} 86400
   remote:
     url: "http://localhost:9115/metrics"
 ```
+
+---
+
+### 5️⃣ type: mongodb — MongoDB 进度表心跳监控
+
+监控"自己写进度表"的服务（区块扫描器、定时任务等）：只读查询集合中的进度文档，
+输出**进程是否存活 + 进度数值**。典型用例：SWTC 公链扫描器把已扫区块高度写进
+`<库>.blockno`，跨链排行 cronjob 把进度写进 `skywell_sum.process_status`。
+
+**核心设计（方案 A 兜底 + A1 语义）：**
+
+| 行为 | 说明 |
+|------|------|
+| 存活指标 | 每个 target 固定输出 `mongodb_probe_up{name="<target名>"}`：查询成功=1 |
+| 失败语义 | 连接失败 / 库表不存在 / 无匹配文档 → 只发 `up=0`，**不发任何数值指标**（防旧值误判"数据还新鲜"） |
+| 数值指标 | 按 `metrics` 配置从文档字段读取，原样输出为 Gauge（int/float/string/时间戳都支持） |
+| 只读 | 仅执行 find/findOne，**绝不写入** MongoDB |
+
+**字段说明：**
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `uri` | ✅ | MongoDB 连接串（如 `mongodb://host:27017/?directConnection=true`） |
+| `database` | ✅ | 目标数据库 |
+| `collection` | ✅ | 目标集合 |
+| `query` | ❌ | 过滤条件；**为空=取集合最新文档**（`find().sort({_id:-1}).limit(1)`） |
+| `metrics[]` | ✅ | 数组，每项 `{name, field}` 定义一个输出指标 |
+| `metrics[].name` | ✅ | Prometheus 指标名（如 `swtc_scan_end`） |
+| `metrics[].field` | ✅ | 文档中的字段名（如 `end`、`updateAt`） |
+
+**示例 — 区块扫描器进度：**
+
+```yaml
+- name: "swtc_balance"
+  type: mongodb
+  uri: "mongodb://192.168.66.254:27018/?directConnection=true"
+  database: "skywell_profit"
+  collection: "blockno"
+  query: { processName: "scan_balance" }   # 必须配：该集合存在新旧两条记录
+  interval: 30s
+  metrics:
+    - { name: "swtc_scan_last_update", field: "updateAt" }  # 毫秒时间戳
+    - { name: "swtc_scan_end", field: "end" }               # 已扫区块高度
+  labels:
+    env: "prod"
+    tier: "blockchain"
+```
+
+**示例 — 定时任务（进度在 process_status 表）：**
+
+```yaml
+- name: "swtc_cron_cross_chain"
+  type: mongodb
+  uri: "mongodb://192.168.66.254:27018/?directConnection=true"
+  database: "skywell_sum"
+  collection: "process_status"
+  query: { processName: "scan_cross_chain_rank_v2" }
+  metrics:
+    - { name: "swtc_cron_last_update", field: "updateAt" }
+  labels:
+    env: "prod"
+    tier: "blockchain"
+```
+
+**暴露指标：**
+
+| 指标 | 标签 | 说明 |
+|------|------|------|
+| `mongodb_probe_up` | `name, env, tier` + global | 查询成功=1，失败=0（失败时无数值指标） |
+| `<metrics[].name>` | 同上 | 文档字段值（原始输出） |
+
+**PromQL 使用建议（判定逻辑放查询端）：**
+
+```promql
+# 心跳新鲜度: updateAt 是毫秒 → 与 time()*1000 比较
+time()*1000 - swtc_scan_last_update > 300000   # 5 分钟未更新 → 告警
+
+# 进程探测失败
+mongodb_probe_up{name="swtc_balance"} < 1
+
+# cron 任务停滞（比如 > 90 分钟未跑）
+time()*1000 - swtc_cron_last_update > 5400000
+```
+
+**注意事项：**
+
+- ⚠️ 若集合存在多条记录（如历史遗留无 `processName` 的旧记录），**必须配 `query` 按 processName 过滤**，否则 `findOne` 会读到过期文档；
+- `updateAt` 若为 `Date.now()` 毫秒值，PromQL 需用 `time()*1000` 对齐；若为秒级时间戳则用 `time()`；
+- 连接串建议用 `?directConnection=true` 直连避免 discovery
 
 ---
 
